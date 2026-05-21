@@ -6,6 +6,11 @@ API token (created at id.atlassian.com → Security → API tokens).
 API v3 is used because v2 is in maintenance mode. v3 requires comment bodies
 in Atlassian Document Format (ADF) — we wrap plain text into a minimal ADF doc.
 Descriptions returned by v3 are usually ADF too, so we flatten them on the way in.
+
+Multi-account (Phase 1): clients are keyed by `JiraAccount.id` so multiple
+workspaces stay isolated. `get_jira_client()` with no argument falls back to
+the default account, matching the pre-multi-account call sites that haven't
+been refactored to plumb an account through yet.
 """
 
 from __future__ import annotations
@@ -15,26 +20,27 @@ from typing import Any
 
 import httpx
 
-from ..config import get_settings
 from ..db import session_scope
-from ..models import Ticket
+from ..models import JiraAccount, Ticket
 from sqlalchemy import select
 
 log = logging.getLogger(__name__)
 
-_client: "JiraClient | None" = None
+_clients: dict[int, "JiraClient"] = {}
 
 
 class JiraClient:
-    def __init__(self) -> None:
-        s = get_settings()
-        if not s.has_jira:
+    def __init__(self, account: JiraAccount) -> None:
+        from .jira_accounts import account_auth
+
+        if not account.base_url or not account.email or not account.api_token:
             raise RuntimeError(
-                "Jira not configured. Set JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN in .env."
+                f"Jira account {account.id} ({account.label}) is missing required credentials."
             )
-        self._base = s.jira_base_url.rstrip("/")
+        self._account_id = account.id
+        self._base = account.base_url.rstrip("/")
         self._client = httpx.AsyncClient(
-            auth=(s.jira_email, s.jira_api_token),
+            auth=account_auth(account),
             timeout=30.0,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
         )
@@ -64,26 +70,41 @@ class JiraClient:
         return r.json()
 
 
-def get_jira_client() -> JiraClient | None:
-    """Returns a singleton JiraClient if Jira is configured, else None.
-    Callers that want graceful degradation (post-comment failures shouldn't crash agents)
-    should check for None and log+skip."""
-    global _client
-    if _client is not None:
-        return _client
-    s = get_settings()
-    if not s.has_jira:
-        return None
-    _client = JiraClient()
-    return _client
+async def get_jira_client(account: JiraAccount | None = None) -> JiraClient | None:
+    """Return a cached client for the given account. If `account` is None, the
+    default account is used (back-compat for callers that haven't been threaded
+    through). Returns None if no Jira account is configured."""
+    from .jira_accounts import get_default_account
+
+    if account is None:
+        account = await get_default_account()
+        if account is None:
+            return None
+
+    cached = _clients.get(account.id)
+    if cached is not None:
+        return cached
+    client = JiraClient(account)
+    _clients[account.id] = client
+    return client
+
+
+async def invalidate_jira_client(account_id: int) -> None:
+    """Drop the cached client for an account — call when credentials change
+    or the account is deleted."""
+    client = _clients.pop(account_id, None)
+    if client is not None:
+        await client.aclose()
 
 
 async def close_jira_client() -> None:
-    """Called from FastAPI shutdown hook."""
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    """Close every cached client. Called from FastAPI shutdown."""
+    while _clients:
+        _, client = _clients.popitem()
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 # ----------------- ADF helpers -----------------
@@ -182,6 +203,10 @@ async def upsert_ticket(payload: dict[str, Any]) -> Ticket:
             row = Ticket(key=key)
             db.add(row)
         row.project = payload.get("project", row.project or "")
+        if payload.get("jira_account_id") is not None:
+            row.jira_account_id = payload["jira_account_id"]
+        if payload.get("organization_id") is not None:
+            row.organization_id = payload["organization_id"]
         row.summary = payload.get("summary", row.summary or "")
         row.description = payload.get("description", row.description or "")
         row.status = payload.get("status", row.status or "To Do")

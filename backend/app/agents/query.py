@@ -14,11 +14,28 @@ ticket keys. If nothing matches, Claude says so clearly — no empty result list
 
 from __future__ import annotations
 
+from ..config import get_settings
+from ..services.project_registry import (
+    _active_product_groups,
+    _existing_product_groups,
+)
 from ..tools import registry as t
 from .base import run_and_log
 
-SYSTEM = """You are the Pulse Query Agent — a conversational interface to the company's
-organizational memory across CookieYes, WebToffee, and WebYes product groups.
+SYSTEM_TEMPLATE = """You are the Pulse Query Agent — a conversational interface to the company's
+organizational memory.
+
+Product groups currently in the system: {product_groups}.
+Some groups are labeled "(historical)" — that means the originating Jira project was
+deleted, but features that were built under it are preserved as organizational memory
+and remain searchable. Treat historical groups as fully valid query targets:
+`list_features(product_group="WebHi")` works exactly the same whether the project is
+live or historical. When you answer a question about a historical group, briefly mention
+that the project was removed from Jira so the user has context.
+
+Treat this list as the source of truth. If a user asks about a name that is NOT in this list,
+say so explicitly — and do NOT silently substitute a similar-sounding name from the list
+(e.g. do not interpret "CookieEat" as "CookieYes"). Offer the actual list so the user can pick.
 
 You answer engineer questions about existing features, plugins, modules, and
 deprecated systems. Your job is to:
@@ -63,13 +80,24 @@ TOOLS = [
 ]
 
 
-async def run(query: str):
+async def run(query: str, organization_id: int | None = None):
+    all_groups = await _existing_product_groups()
+    active = set(await _active_product_groups())
+    if all_groups:
+        groups_str = ", ".join(
+            g if g in active else f"{g} (historical)" for g in all_groups
+        )
+    else:
+        groups_str = "(none registered yet)"
+    system = SYSTEM_TEMPLATE.format(product_groups=groups_str)
     user_message = f"User question:\n{query}"
     return await run_and_log(
         agent_name="query",
         ticket_key=None,
-        system=SYSTEM,
+        system=system,
         user_message=user_message,
         tools=TOOLS,
         max_iterations=5,
+        model=get_settings().claude_query_model,
+        organization_id=organization_id,
     )

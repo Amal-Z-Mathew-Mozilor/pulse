@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from sqlalchemy import delete as sqla_delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import get_settings
 from ..db import get_session, session_scope
-from ..models import Alert, Feature
+from ..dependencies import get_current_user
+from ..models import Alert, Feature, User
 from ..schemas import AlertOut, FeatureOut, RelatedFeatureOut
 from ..services.vector_store import get_store
 
@@ -18,8 +18,17 @@ TICKET_KEY_RE = re.compile(r"\b[A-Z]{2,8}-\d+\b")
 
 
 @router.get("/alerts", response_model=list[AlertOut])
-async def list_alerts(unread_only: bool = False, db: AsyncSession = Depends(get_session)):
-    stmt = select(Alert).order_by(Alert.created_at.desc()).limit(100)
+async def list_alerts(
+    unread_only: bool = False,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = (
+        select(Alert)
+        .where(Alert.organization_id == current_user.organization_id)
+        .order_by(Alert.created_at.desc())
+        .limit(100)
+    )
     if unread_only:
         stmt = stmt.where(Alert.read_at.is_(None))
     rows = (await db.execute(stmt)).scalars().all()
@@ -27,10 +36,16 @@ async def list_alerts(unread_only: bool = False, db: AsyncSession = Depends(get_
 
 
 @router.post("/alerts/{alert_id}/read", response_model=AlertOut)
-async def mark_read(alert_id: int, db: AsyncSession = Depends(get_session)):
+async def mark_read(
+    alert_id: int,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     alert = await db.get(Alert, alert_id)
     if alert is None:
         raise HTTPException(404, f"alert {alert_id} not found")
+    if alert.organization_id != current_user.organization_id:
+        raise HTTPException(403, "Access denied")
     alert.read_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(alert)
@@ -38,11 +53,17 @@ async def mark_read(alert_id: int, db: AsyncSession = Depends(get_session)):
 
 
 @router.delete("/alerts/{alert_id}", status_code=204)
-async def delete_alert(alert_id: int, db: AsyncSession = Depends(get_session)):
+async def delete_alert(
+    alert_id: int,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     """Permanently remove a single alert. Returns 204 on success, 404 if missing."""
     alert = await db.get(Alert, alert_id)
     if alert is None:
         raise HTTPException(404, f"alert {alert_id} not found")
+    if alert.organization_id != current_user.organization_id:
+        raise HTTPException(403, "Access denied")
     await db.delete(alert)
     await db.commit()
     return Response(status_code=204)
@@ -63,7 +84,11 @@ def _now_iso() -> str:
 
 
 @router.post("/alerts/{alert_id}/approve", response_model=AlertOut)
-async def approve_pending_deprecation(alert_id: int, body: ApproveBody | None = None):
+async def approve_pending_deprecation(
+    alert_id: int,
+    body: ApproveBody | None = None,
+    current_user: User = Depends(get_current_user),
+):
     """Resolve a pending_deprecation alert by deprecating the approved features.
 
     Body:
@@ -76,6 +101,8 @@ async def approve_pending_deprecation(alert_id: int, body: ApproveBody | None = 
         alert = await db.get(Alert, alert_id)
         if alert is None:
             raise HTTPException(404, f"alert {alert_id} not found")
+        if alert.organization_id != current_user.organization_id:
+            raise HTTPException(403, "Access denied")
         if alert.type != "pending_deprecation":
             raise HTTPException(409, "approve is only valid on pending_deprecation alerts")
         if alert.approval_state == "resolved":
@@ -102,7 +129,10 @@ async def approve_pending_deprecation(alert_id: int, body: ApproveBody | None = 
         rows = []
         if approved_keys:
             res = await db.execute(
-                select(Feature).where(Feature.ticket_key.in_(approved_keys))
+                select(Feature).where(
+                    Feature.ticket_key.in_(approved_keys),
+                    Feature.organization_id == current_user.organization_id,
+                )
             )
             rows = list(res.scalars().all())
 
@@ -126,6 +156,7 @@ async def approve_pending_deprecation(alert_id: int, body: ApproveBody | None = 
                     "status": "deprecated",
                     "deprecation_reason": reason,
                     "ticket_key": feature.ticket_key,
+                    "organization_id": feature.organization_id,
                 },
             )
             deprecated_ids.append(feature.id)
@@ -148,13 +179,19 @@ async def approve_pending_deprecation(alert_id: int, body: ApproveBody | None = 
 
 
 @router.post("/alerts/{alert_id}/reject", response_model=AlertOut)
-async def reject_pending_deprecation(alert_id: int, body: RejectBody | None = None):
+async def reject_pending_deprecation(
+    alert_id: int,
+    body: RejectBody | None = None,
+    current_user: User = Depends(get_current_user),
+):
     """Reject a pending_deprecation alert without deprecating anything."""
     reason = (body.reason if body else None) or "Rejected via dashboard."
     async with session_scope() as db:
         alert = await db.get(Alert, alert_id)
         if alert is None:
             raise HTTPException(404, f"alert {alert_id} not found")
+        if alert.organization_id != current_user.organization_id:
+            raise HTTPException(403, "Access denied")
         if alert.type != "pending_deprecation":
             raise HTTPException(409, "reject is only valid on pending_deprecation alerts")
         if alert.approval_state == "resolved":
@@ -172,6 +209,7 @@ async def reject_pending_deprecation(alert_id: int, body: RejectBody | None = No
 async def bulk_delete_alerts(
     status: str | None = None,
     db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
     """Bulk-delete alerts. Currently only `?status=read` is supported — guards
     against accidentally wiping the whole feed via a bare DELETE on the
@@ -181,7 +219,10 @@ async def bulk_delete_alerts(
             400, "missing or invalid `status` query param (only 'read' is supported)"
         )
     result = await db.execute(
-        sqla_delete(Alert).where(Alert.read_at.is_not(None))
+        sqla_delete(Alert).where(
+            Alert.read_at.is_not(None),
+            Alert.organization_id == current_user.organization_id,
+        )
     )
     await db.commit()
     # SQLAlchemy returns rowcount on DELETE for most dialects (incl. SQLite/Postgres).
@@ -189,7 +230,11 @@ async def bulk_delete_alerts(
 
 
 @router.get("/alerts/{alert_id}/related-features", response_model=list[RelatedFeatureOut])
-async def alert_related_features(alert_id: int, db: AsyncSession = Depends(get_session)):
+async def alert_related_features(
+    alert_id: int,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     """Resolve the features referenced by an alert into full records.
 
     Resolution order:
@@ -201,9 +246,21 @@ async def alert_related_features(alert_id: int, db: AsyncSession = Depends(get_s
     alert = await db.get(Alert, alert_id)
     if alert is None:
         raise HTTPException(404, f"alert {alert_id} not found")
+    if alert.organization_id != current_user.organization_id:
+        raise HTTPException(403, "Access denied")
 
-    settings = get_settings()
-    jira_base = settings.jira_base_url.rstrip("/") if settings.jira_base_url else None
+    # Multi-account: each Feature carries its `jira_account_id`, and the
+    # deep-link must point at THAT account's workspace. We resolve account
+    # base URLs in bulk below — see _build_jira_url.
+    from ..models import JiraAccount as _JiraAccount
+    account_rows = (await db.execute(select(_JiraAccount))).scalars().all()
+    account_base_by_id: dict[int, str] = {
+        a.id: a.base_url.rstrip("/") for a in account_rows if a.base_url
+    }
+    default_base = next(
+        (a.base_url.rstrip("/") for a in account_rows if a.is_default and a.base_url),
+        next((a.base_url.rstrip("/") for a in account_rows if a.base_url), None),
+    )
     source_key = (alert.ticket_key or "").upper()
 
     # Build ordered list of (ticket_key, score) without duplicates.
@@ -233,10 +290,15 @@ async def alert_related_features(alert_id: int, db: AsyncSession = Depends(get_s
     if not refs:
         return []
 
-    # Bulk-fetch the matching features in one query.
+    # Bulk-fetch the matching features in one query (scoped to org).
     ticket_keys = [tk for tk, _ in refs]
     rows = (
-        await db.execute(select(Feature).where(Feature.ticket_key.in_(ticket_keys)))
+        await db.execute(
+            select(Feature).where(
+                Feature.ticket_key.in_(ticket_keys),
+                Feature.organization_id == current_user.organization_id,
+            )
+        )
     ).scalars().all()
     by_key = {f.ticket_key: f for f in rows if f.ticket_key}
 
@@ -247,11 +309,16 @@ async def alert_related_features(alert_id: int, db: AsyncSession = Depends(get_s
             # The alert references a ticket we don't have a feature record for.
             # Skip silently — the empty-state UI handles "no related features".
             continue
+        feat_base = (
+            account_base_by_id.get(feat.jira_account_id)
+            if feat.jira_account_id is not None
+            else None
+        ) or default_base
         out.append(
             RelatedFeatureOut(
                 feature=FeatureOut.model_validate(feat),
                 similarity_score=score,
-                open_in_jira_url=(f"{jira_base}/browse/{tk}" if jira_base else None),
+                open_in_jira_url=(f"{feat_base}/browse/{tk}" if feat_base else None),
             )
         )
     return out

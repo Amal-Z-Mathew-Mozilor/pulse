@@ -62,6 +62,7 @@ async def run_agent(
     user_message: str,
     tools: list[ToolSpec],
     max_iterations: int = 6,
+    model: str | None = None,
 ) -> AgentResult:
     """Run a Claude tool-using agent loop.
 
@@ -74,6 +75,7 @@ async def run_agent(
         return await _stub_run(system=system, user_message=user_message, tools=tools)
 
     settings = get_settings()
+    effective_model = model or settings.claude_model
     tool_index = {t.name: t for t in tools}
     anthropic_tools = [t.to_anthropic_tool() for t in tools]
 
@@ -84,7 +86,7 @@ async def run_agent(
 
     for _ in range(max_iterations):
         response = await client.messages.create(
-            model=settings.claude_model,
+            model=effective_model,
             max_tokens=4096,
             system=[
                 {

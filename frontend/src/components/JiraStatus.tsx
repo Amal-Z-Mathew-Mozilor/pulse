@@ -8,6 +8,8 @@ export default function JiraStatus() {
   const [loading, setLoading] = useState(true);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -33,6 +35,31 @@ export default function JiraStatus() {
     load();
   }
 
+  async function syncNow() {
+    setSyncing(true);
+    setSyncMessage(null);
+    try {
+      const result = await api.syncProjects();
+      if (result.error) {
+        setSyncMessage(`Sync error: ${result.error}`);
+      } else {
+        const parts: string[] = [];
+        if (result.new_projects.length) {
+          parts.push(`Added ${result.new_projects.join(", ")}`);
+        }
+        if (result.deleted_projects.length) {
+          parts.push(`Removed ${result.deleted_projects.join(", ")} (no longer in Jira)`);
+        }
+        setSyncMessage(parts.length ? parts.join(" · ") : "Already up to date.");
+      }
+      load();
+    } catch (err) {
+      setSyncMessage(err instanceof Error ? `Sync failed: ${err.message}` : "Sync failed");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   return (
     <>
       <h2>Jira & Agents</h2>
@@ -48,14 +75,32 @@ export default function JiraStatus() {
         </div>
       </div>
 
-      <h3 style={{ marginTop: 24 }}>Registered projects</h3>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Auto-registered the first time Pulse receives a webhook from each project. Claude assigns the
-        product group from Jira's project name + description. Click <em>Edit</em> to override.
+      <div className="row" style={{ marginTop: 24, alignItems: "baseline" }}>
+        <h3 style={{ margin: 0 }}>Registered projects</h3>
+        <div className="spacer" />
+        <button
+          className="secondary"
+          onClick={syncNow}
+          disabled={syncing}
+          title="Pull every project from Jira right now"
+        >
+          {syncing ? "Syncing…" : "Sync from Jira"}
+        </button>
+      </div>
+      <p className="muted" style={{ marginTop: 6 }}>
+        Auto-discovered from Jira on a background poll — new spaces appear here as soon as
+        they're created in Jira, and spaces deleted from Jira are removed on the next sync.
+        Click <em>Edit</em> to override the inferred product group (also migrates every ticket
+        and feature under the project).
       </p>
+      {syncMessage && (
+        <div className="banner" style={{ marginBottom: 12, fontSize: 13 }}>
+          {syncMessage}
+        </div>
+      )}
       {projects.length === 0 && (
         <div className="empty">
-          No projects yet. They'll appear here automatically the first time a webhook fires.
+          No projects yet. Hit <em>Sync from Jira</em> above, or wait for the next background poll.
         </div>
       )}
       {projects.map((p) => (
@@ -64,6 +109,15 @@ export default function JiraStatus() {
             <strong>{p.key}</strong>
             <span className="muted">{p.name}</span>
             <div className="spacer" />
+            {p.jira_account_label && (
+              <span
+                className="badge"
+                title={`Jira account: ${p.jira_account_label}`}
+                style={{ opacity: 0.85 }}
+              >
+                @ {p.jira_account_label}
+              </span>
+            )}
             <span className="badge">{p.product_group || "(unset)"}</span>
             {p.is_inferred ? (
               <span className="badge" title="Inferred by Claude">inferred</span>

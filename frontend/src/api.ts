@@ -50,8 +50,51 @@ export type Project = {
   description: string;
   product_group: string;
   is_inferred: boolean;
+  jira_account_id: number | null;
+  jira_account_label: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type JiraAccount = {
+  id: number;
+  label: string;
+  base_url: string;
+  email: string;
+  is_active: boolean;
+  is_default: boolean;
+  has_token: boolean;
+  has_webhook_secret: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type JiraAccountCreate = {
+  label: string;
+  base_url: string;
+  email: string;
+  api_token: string;
+  webhook_secret?: string;
+  is_active?: boolean;
+  is_default?: boolean;
+};
+
+export type JiraAccountUpdate = {
+  label?: string;
+  base_url?: string;
+  email?: string;
+  api_token?: string;       // blank/undefined = keep existing
+  webhook_secret?: string;
+  is_active?: boolean;
+  is_default?: boolean;
+};
+
+export type JiraAccountTestResult = {
+  ok: boolean;
+  status_code: number | null;
+  message: string;
+  user_displayname?: string | null;
+  user_email?: string | null;
 };
 
 export type AgentRun = {
@@ -65,16 +108,152 @@ export type AgentRun = {
   finished_at?: string | null;
 };
 
+// In production (Vercel), set VITE_API_BASE_URL to your backend URL (e.g. ngrok).
+// In dev, leave it empty — Vite's proxy handles /api, /auth, /jira-webhook.
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+
+const TOKEN_KEY = "pulse_token";
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-  });
+  const token = getToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (init?.headers) {
+    Object.entries(init.headers as Record<string, string>).forEach(([k, v]) => { headers[k] = v; });
+  }
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  // ngrok free tier shows a browser warning page; this header skips it for API calls.
+  if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+  const res = await fetch(API_BASE + path, { ...init, headers });
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error("Unauthorized");
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  // 204 No Content has an empty body; don't try to parse JSON.
   if (res.status === 204) return undefined as T;
   return res.json();
 }
+
+export type AuthUser = {
+  id: number;
+  username: string;
+  email: string;
+  is_active: boolean;
+  is_admin: boolean;
+  created_at: string;
+};
+
+export const auth = {
+  login: async (username: string, password: string): Promise<{ access_token: string; token_type: string }> => {
+    const body = new URLSearchParams({ username, password });
+    const loginHeaders: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded" };
+    if (API_BASE) loginHeaders["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(API_BASE + "/auth/login", {
+      method: "POST",
+      headers: loginHeaders,
+      body: body.toString(),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Login failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+
+  me: () => http<AuthUser>("/auth/me"),
+
+  verifyEmail: async (token: string): Promise<{ access_token: string; token_type: string }> => {
+    const headers: Record<string, string> = {};
+    if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(`${API_BASE}/auth/verify?token=${encodeURIComponent(token)}`, { headers });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Verification failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+
+  forgotPassword: async (email: string): Promise<{ message: string }> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Request failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+
+  googleLogin: async (accessToken: string): Promise<{ access_token: string; token_type: string }> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(`${API_BASE}/auth/google`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ access_token: accessToken }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Google sign-in failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+
+  resetPassword: async (
+    token: string,
+    new_password: string,
+  ): Promise<{ access_token: string; token_type: string }> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(`${API_BASE}/auth/reset-password`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ token, new_password }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Reset failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+
+  signup: async (
+    username: string,
+    email: string,
+    password: string,
+    mode: "create" | "join",
+    company_name?: string,
+  ): Promise<{ message: string; email: string }> => {
+    const signupHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_BASE) signupHeaders["ngrok-skip-browser-warning"] = "true";
+    const res = await fetch(API_BASE + "/auth/signup", {
+      method: "POST",
+      headers: signupHeaders,
+      body: JSON.stringify({ username, email, password, mode, company_name }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Signup failed" }));
+      throw new Error(err.detail || `${res.status}`);
+    }
+    return res.json();
+  },
+};
 
 export const api = {
   search: (query: string, top_k = 5, filters?: Record<string, string>) =>
@@ -135,4 +314,36 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ product_group }),
     }),
+
+  syncProjects: () =>
+    http<{
+      synced: number;
+      new_projects: string[];
+      deleted_projects: string[];
+      error?: string;
+    }>("/api/projects/sync", { method: "POST" }),
+
+  jiraAccounts: {
+    list: () => http<JiraAccount[]>("/api/jira-accounts"),
+
+    create: (body: JiraAccountCreate) =>
+      http<JiraAccount>("/api/jira-accounts", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+
+    update: (id: number, body: JiraAccountUpdate) =>
+      http<JiraAccount>(`/api/jira-accounts/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      }),
+
+    delete: (id: number) =>
+      http<void>(`/api/jira-accounts/${id}`, { method: "DELETE" }),
+
+    test: (id: number) =>
+      http<JiraAccountTestResult>(`/api/jira-accounts/${id}/test`, {
+        method: "POST",
+      }),
+  },
 };

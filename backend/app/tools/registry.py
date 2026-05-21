@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update as sqla_update
 
 import re
 from datetime import datetime, timezone
 
+from ..context import org_id_var
 from ..db import session_scope
 from ..models import Feature, Ticket
 from ..services import alert_bus, jira_client
@@ -26,7 +27,9 @@ from ..services.vector_store import get_store
 async def _search_similar_features(args: dict[str, Any]) -> dict[str, Any]:
     query = args.get("query", "")
     top_k = int(args.get("top_k", 5))
-    matches = get_store().query_text(query, top_k=top_k)
+    org_id = org_id_var.get()
+    filter_dict = {"organization_id": org_id} if org_id is not None else None
+    matches = get_store().query_text(query, top_k=top_k, filter=filter_dict)
     out = []
     for m in matches:
         out.append(
@@ -97,7 +100,7 @@ async def _add_jira_comment(args: dict[str, Any]) -> dict[str, Any]:
     ticket_key = args["ticket_key"]
     body = args["body"]
 
-    client = jira_client.get_jira_client()
+    client = await jira_client.get_jira_client()
     jira_result: dict[str, Any] | str
     if client is None:
         jira_result = "jira_not_configured"
@@ -223,16 +226,22 @@ create_alert = ToolSpec(
 # -------- store_feature --------
 
 async def _store_feature(args: dict[str, Any]) -> dict[str, Any]:
+    org_id = org_id_var.get()
     async with session_scope() as db:
         feature = Feature(
             name=args["name"],
             summary=args["summary"],
             team=args.get("team", "Unknown"),
-            product_group=args.get("product_group", "WebToffee"),
+            # No default — if the orchestrator didn't pass a product_group, store
+            # it empty rather than silently bucketing into WebToffee. The
+            # orchestrator pulls product_group from the Project row, so this
+            # should always be set in practice.
+            product_group=(args.get("product_group") or "").strip(),
             ticket_key=args.get("ticket_key"),
             dependencies=args.get("dependencies", []),
             changelog=args.get("changelog"),
             status="active",
+            organization_id=org_id,
         )
         db.add(feature)
         await db.flush()
@@ -248,6 +257,7 @@ async def _store_feature(args: dict[str, Any]) -> dict[str, Any]:
                 "product_group": feature.product_group,
                 "status": feature.status,
                 "ticket_key": feature.ticket_key,
+                "organization_id": org_id,
             },
         )
         return {"feature_id": feature.id, "ok": True}
@@ -267,7 +277,14 @@ store_feature = ToolSpec(
             "name": {"type": "string", "description": "Short, descriptive feature name."},
             "summary": {"type": "string", "description": "2–4 sentence implementation summary."},
             "team": {"type": "string"},
-            "product_group": {"type": "string", "enum": ["CookieYes", "WebToffee", "WebYes"]},
+            "product_group": {
+                "type": "string",
+                "description": (
+                    "Product group the feature belongs to. Use the exact label from "
+                    "the source ticket's project (the orchestrator passes this in). "
+                    "Do NOT substitute a similar-sounding existing group."
+                ),
+            },
             "ticket_key": {"type": "string"},
             "dependencies": {"type": "array", "items": {"type": "string"}, "default": []},
             "changelog": {"type": "string", "description": "Markdown changelog entry."},
@@ -281,8 +298,11 @@ store_feature = ToolSpec(
 # -------- list_features (metadata filter, not similarity) --------
 
 async def _list_features(args: dict[str, Any]) -> dict[str, Any]:
+    org_id = org_id_var.get()
     async with session_scope() as db:
         stmt = select(Feature).order_by(Feature.updated_at.desc())
+        if org_id is not None:
+            stmt = stmt.where(Feature.organization_id == org_id)
         if args.get("status"):
             stmt = stmt.where(Feature.status == args["status"])
         if args.get("product_group"):
@@ -321,7 +341,14 @@ list_features = ToolSpec(
         "type": "object",
         "properties": {
             "status": {"type": "string", "enum": ["active", "deprecated"]},
-            "product_group": {"type": "string", "enum": ["CookieYes", "WebToffee", "WebYes"]},
+            "product_group": {
+                "type": "string",
+                "description": (
+                    "Exact product-group label to filter by. Match must be exact — "
+                    "if you're unsure of the spelling, omit this filter and inspect "
+                    "the results."
+                ),
+            },
             "team": {"type": "string", "description": "Owning team name (e.g. 'Checkout', 'Compliance')."},
             "limit": {"type": "integer", "default": 20},
         },
@@ -334,9 +361,12 @@ list_features = ToolSpec(
 
 async def _get_feature(args: dict[str, Any]) -> dict[str, Any]:
     feature_id = int(args["feature_id"])
+    org_id = org_id_var.get()
     async with session_scope() as db:
         f = await db.get(Feature, feature_id)
         if f is None:
+            return {"error": f"feature {feature_id} not found"}
+        if org_id is not None and f.organization_id != org_id:
             return {"error": f"feature {feature_id} not found"}
         return {
             "id": f.id,
@@ -399,10 +429,52 @@ async def _mark_feature_deprecated(args: dict[str, Any]) -> dict[str, Any]:
                 "suggested_action": "use_notify_cross_product",
             }
 
-        feature.status = "deprecated"
-        feature.deprecation_reason = reason
-        feature.restored_at = None
-        feature.restored_reason = None
+        # ------------------------------------------------------------------
+        # OPTIMISTIC CONCURRENCY — second guardrail.
+        # Two webhooks for the same ticket can fire concurrently. Both
+        # transactions read status='active', both write status='deprecated'.
+        # The second write clobbers `restored_at`/`restored_reason` if a
+        # human-restore happened between the read and the write.
+        # We pin the UPDATE to the status we observed, so if the row changed
+        # under us the UPDATE matches zero rows and we report it cleanly.
+        # ------------------------------------------------------------------
+        original_status = feature.status
+        if original_status == "deprecated":
+            # Idempotent success — another writer (or a retry) already deprecated this.
+            return {
+                "ok": True,
+                "feature_id": feature.id,
+                "already_deprecated": True,
+            }
+
+        result = await db.execute(
+            sqla_update(Feature)
+            .where(Feature.id == feature_id, Feature.status == original_status)
+            .values(
+                status="deprecated",
+                deprecation_reason=reason,
+                restored_at=None,
+                restored_reason=None,
+            )
+        )
+        if (result.rowcount or 0) == 0:
+            # Row was modified between our read and our write. Surface
+            # cleanly — the caller (Claude) can decide whether to re-read
+            # and retry. Do NOT silently overwrite.
+            return {
+                "error": "concurrent_modification",
+                "message": (
+                    f"Feature {feature_id} was modified by another writer between "
+                    f"the read (status='{original_status}') and the write. Re-read "
+                    f"its state with get_feature and decide whether to retry."
+                ),
+                "feature_id": feature_id,
+                "observed_status": original_status,
+            }
+
+        # Refresh the in-memory object so the vector-store payload below sees
+        # the new state (SQLAlchemy doesn't auto-refresh after a Core UPDATE).
+        await db.refresh(feature)
         # Reflect the deprecation in the vector store metadata.
         get_store().upsert_text(
             id=f"feature:{feature.id}",
@@ -416,6 +488,7 @@ async def _mark_feature_deprecated(args: dict[str, Any]) -> dict[str, Any]:
                 "status": "deprecated",
                 "deprecation_reason": reason,
                 "ticket_key": feature.ticket_key,
+                "organization_id": feature.organization_id,
             },
         )
         return {"ok": True, "feature_id": feature.id}

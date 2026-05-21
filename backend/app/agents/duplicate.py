@@ -1,17 +1,13 @@
 from __future__ import annotations
-
 from ..tools import registry as t
 from .base import run_and_log
-
 SYSTEM = """You are the Duplicate Detection Agent inside an AI organizational memory platform.
-
 Context: this company has three product groups (CookieYes, WebToffee, WebYes) and many teams that
 work independently. Engineers often unknowingly rebuild capabilities that already exist elsewhere
 in the org, or that were previously deprecated for a known reason.
 
 Your job: given a NEW Jira ticket, decide whether it duplicates or overlaps with existing
 organizational knowledge, and act on that decision.
-
 Workflow:
 1. Call `search_similar_features` with a focused, semantic description of what the ticket is
    asking for. Strip out boilerplate ("as a user I want to...") and search for the underlying
@@ -36,18 +32,20 @@ Workflow:
        dashboard's "View Details" panel — without it, users see only your prose.
 4. If matches are ambiguous, post a clarifying question on the ticket instead of a warning.
 5. If no credible duplicate exists, do nothing — silence is correct.
-
 After acting, write a single sentence summarizing what you did. Keep it under 200 chars."""
-
-
 TOOLS = [
     t.search_similar_features,
     t.add_jira_comment,
     t.create_alert,
 ]
-
-
-async def run(ticket_key: str, summary: str, description: str, team: str, product_group: str):
+async def run(
+    ticket_key: str,
+    summary: str,
+    description: str,
+    team: str,
+    product_group: str,
+    organization_id: int | None = None,
+):
     user_message = (
         f"New ticket {ticket_key} created by team={team} in product_group={product_group}.\n"
         f"Summary: {summary}\n\nDescription: {description or '(none)'}\n\n"
@@ -59,4 +57,5 @@ async def run(ticket_key: str, summary: str, description: str, team: str, produc
         system=SYSTEM,
         user_message=user_message,
         tools=TOOLS,
+        organization_id=organization_id,
     )

@@ -31,6 +31,11 @@ _ADDITIVE_MIGRATIONS: list[tuple[str, str, str]] = [
     ("alerts", "approval_state", "VARCHAR(16)"),
     ("alerts", "action_log", "JSON DEFAULT '[]'"),
     ("tickets", "last_deprecation_preview", "JSON"),
+    # Multi-account Jira support (Phase 1). Nullable on existing tables so old
+    # rows can be backfilled to the default account during boot.
+    ("projects", "jira_account_id", "INTEGER"),
+    ("tickets", "jira_account_id", "INTEGER"),
+    ("features", "jira_account_id", "INTEGER"),
 ]
 
 
@@ -40,6 +45,61 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _apply_additive_migrations(conn)
+    await _create_default_admin()
+    await _bootstrap_jira_accounts()
+
+
+async def _bootstrap_jira_accounts() -> None:
+    """First-boot multi-account migration: if `.env` has the legacy JIRA_*
+    variables and no account row exists yet, create the default account and
+    backfill jira_account_id on existing Project/Ticket/Feature rows."""
+    from .services.jira_accounts import (
+        backfill_jira_account_id,
+        seed_default_account_from_env,
+    )
+
+    try:
+        seeded = await seed_default_account_from_env()
+        if seeded is not None:
+            await backfill_jira_account_id()
+    except Exception as exc:
+        # Don't block startup if the bootstrap fails — the admin can fix
+        # account state through the UI/API after boot.
+        import logging
+        logging.getLogger(__name__).warning(
+            "jira_accounts bootstrap failed: %s", exc,
+        )
+
+
+async def _create_default_admin() -> None:
+    """Seed a default admin user from .env on first boot. Idempotent."""
+    from .config import get_settings
+    from .models import User
+
+    s = get_settings()
+    if not s.admin_username or not s.admin_password:
+        return
+    async with SessionLocal() as db:
+        try:
+            from sqlalchemy import select
+            existing = (
+                await db.execute(select(User).where(User.username == s.admin_username))
+            ).scalar_one_or_none()
+            if existing:
+                return
+            from .services.auth import get_password_hash
+            admin = User(
+                username=s.admin_username,
+                email=s.admin_email or f"{s.admin_username}@admin.local",
+                hashed_password=get_password_hash(s.admin_password),
+                is_active=True,
+                is_admin=True,
+            )
+            db.add(admin)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 async def _apply_additive_migrations(conn) -> None:

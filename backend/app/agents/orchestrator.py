@@ -15,12 +15,9 @@ Lifecycle for deprecation tickets:
   issue_updated, anything else   → no-op
   issue_deleted                  → coarse warning, no auto-revert
 """
-
 from __future__ import annotations
-
 import logging
 from typing import Any
-
 from sqlalchemy import select
 
 from ..db import session_scope
@@ -56,9 +53,30 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
         log.warning("orchestrator: event missing project key, ignoring")
         return {"ignored": True, "reason": "missing_project_key"}
 
+    # Multi-account: prefer the account_id stamped on the event by the webhook
+    # router (Phase 3). Falls back to the default account if not specified.
+    jira_account_id = event.get("jira_account_id")
+
+    # Org context — stamped on the event by the webhook router. Defensive
+    # fallback: if a caller forgot to set it, look it up via the Jira account
+    # so we never silently create un-scoped (NULL org) rows.
+    organization_id: int | None = event.get("organization_id")
+    if organization_id is None and jira_account_id is not None:
+        from sqlalchemy import select as _sel
+        from ..db import session_scope as _ss
+        from ..models import JiraAccount as _JA
+        async with _ss() as _db:
+            row = (await _db.execute(_sel(_JA).where(_JA.id == jira_account_id))).scalar_one_or_none()
+            if row is not None:
+                organization_id = row.organization_id
+
     # Resolve / register the project. This is the SOLE place product_group is
     # decided. The first time a project appears, Claude infers its group.
-    project = await project_registry.get_or_register(project_key)
+    project = await project_registry.get_or_register(
+        project_key,
+        jira_account_id=jira_account_id,
+        organization_id=organization_id,
+    )
     product_group = project.product_group or project_key
 
     ticket_key = event["ticket_key"]
@@ -71,6 +89,8 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
             {
                 "key": ticket_key,
                 "project": project_key,
+                "jira_account_id": project.jira_account_id,
+                "organization_id": organization_id,
                 "summary": event.get("summary", ""),
                 "description": event.get("description", ""),
                 "status": event.get("status", "To Do"),
@@ -95,6 +115,7 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
             description=event.get("description", ""),
             team=event.get("team") or "Unassigned",
             product_group=product_group,
+            organization_id=organization_id,
         )
         dispatched.append(
             {"agent": "duplicate", "summary": dup_result.text, "tool_calls": len(dup_result.tool_calls)}
@@ -116,6 +137,7 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
                 capability=capability,
                 reason=event.get("description") or capability,
                 product_group=product_group,
+                organization_id=organization_id,
             )
             dispatched.append(
                 {
@@ -145,7 +167,7 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
                     "orchestrator: ticket %s transitioned to Done — dispatching documentation agent",
                     ticket_key,
                 )
-                doc_result = await documentation.run(ticket_key=ticket_key)
+                doc_result = await documentation.run(ticket_key=ticket_key, organization_id=organization_id)
                 dispatched.append(
                     {"agent": "documentation", "summary": doc_result.text, "tool_calls": len(doc_result.tool_calls)}
                 )
@@ -167,6 +189,7 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
                     reason=event.get("description") or capability,
                     product_group=product_group,
                     previous_preview=previous_preview,
+                    organization_id=organization_id,
                 )
                 dispatched.append(
                     {
@@ -192,7 +215,6 @@ async def handle_event(event: dict[str, Any]) -> dict[str, Any]:
 
         else:
             log.debug("orchestrator: ticket %s updated, no status transition we care about", ticket_key)
-
     elif event_type == EVENT_DELETED:
         # Coarse warning — without a deprecated_by_ticket_key column we can't
         # cheaply name the features affected by a since-deleted ticket.

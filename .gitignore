@@ -6,6 +6,7 @@ venv/
 .env
 *.db
 *.sqlite*
+.pulse_encryption_key
 
 node_modules/
 dist/

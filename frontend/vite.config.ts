@@ -7,6 +7,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://localhost:8000",
+      "/auth": "http://localhost:8000",
       "/jira-webhook": "http://localhost:8000",
     },
   },

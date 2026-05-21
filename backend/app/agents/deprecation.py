@@ -97,7 +97,13 @@ TOOLS_PREVIEW = [
 ]
 
 
-async def run_preview(ticket_key: str, capability: str, reason: str, product_group: str = ""):
+async def run_preview(
+    ticket_key: str,
+    capability: str,
+    reason: str,
+    product_group: str = "",
+    organization_id: int | None = None,
+):
     user_message = (
         f"PREVIEW MODE. Deprecation proposal in ticket {ticket_key}.\n"
         f"Source product group: {product_group or '(unknown)'}\n"
@@ -112,6 +118,7 @@ async def run_preview(ticket_key: str, capability: str, reason: str, product_gro
         system=SYSTEM_PREVIEW,
         user_message=user_message,
         tools=TOOLS_PREVIEW,
+        organization_id=organization_id,
     )
 
 
@@ -255,6 +262,7 @@ async def run_apply(
     reason: str,
     product_group: str = "",
     previous_preview: dict[str, Any] | None = None,
+    organization_id: int | None = None,
 ):
     lines = [
         f"APPLY MODE. Deprecation ticket {ticket_key} just transitioned to Done.",
@@ -280,6 +288,32 @@ async def run_apply(
         system=SYSTEM_APPLY,
         user_message=user_message,
         tools=TOOLS_APPLY,
+        organization_id=organization_id,
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
