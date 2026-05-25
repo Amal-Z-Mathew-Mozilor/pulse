@@ -82,7 +82,10 @@ class JiraAccount(Base):
     __tablename__ = "jira_accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    label: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    # Label is unique PER ORGANIZATION, not globally — two different
+    # orgs can each have a Jira account labeled "Mozilor" without colliding.
+    # The composite uniqueness is enforced via __table_args__ below.
+    label: Mapped[str] = mapped_column(String(128), index=True)
     base_url: Mapped[str] = mapped_column(String(256))
     email: Mapped[str] = mapped_column(String(256))
     api_token: Mapped[str] = mapped_column(String(1024))  # Fernet ciphertext
@@ -92,8 +95,26 @@ class JiraAccount(Base):
     organization_id: Mapped[int | None] = mapped_column(
         ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Persistent health snapshot updated by every sync attempt — so the UI can
+    # show "Connected" / "Token expired" / "Cannot reach Jira" without having
+    # to call /test on page load.
+    #   'never'       — no sync has run yet
+    #   'ok'          — last sync succeeded
+    #   'auth_failed' — 401/403 from Jira; token likely expired
+    #   'not_found'   — 404; base URL is wrong
+    #   'unreachable' — network/timeout/other transient
+    #   'error'       — anything else
+    last_sync_status: Mapped[str] = mapped_column(String(16), default="never")
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    __table_args__ = (
+        # Two different orgs may each have a Jira account labeled "Mozilor".
+        # Uniqueness applies within the org, not globally.
+        UniqueConstraint("organization_id", "label", name="ux_jira_accounts_org_label"),
+    )
 
 
 class Project(Base):

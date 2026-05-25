@@ -13,6 +13,11 @@ export type Feature = {
   restored_reason?: string | null;
   created_at: string;
   updated_at: string;
+  // Which connected Jira workspace this feature belongs to.
+  // null when the originating account was deleted (historical org memory).
+  jira_account_id?: number | null;
+  jira_account_label?: string | null;
+  jira_base_url?: string | null;
 };
 
 export type FeatureSearchHit = { feature: Feature; score: number };
@@ -65,6 +70,12 @@ export type JiraAccount = {
   is_default: boolean;
   has_token: boolean;
   has_webhook_secret: boolean;
+  // Persistent health snapshot, updated by every sync attempt.
+  // "never" = no sync yet, "ok" = last sync worked, "auth_failed" = token
+  // expired/invalid, "not_found" = base URL wrong, "unreachable" = network/5xx.
+  last_sync_status: "never" | "ok" | "auth_failed" | "not_found" | "unreachable" | "error";
+  last_sync_at?: string | null;
+  last_sync_error?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -141,7 +152,23 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
     window.location.reload();
     throw new Error("Unauthorized");
   }
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // Try to read FastAPI's `{"detail": "..."}` body so users see the real
+    // reason ("label 'Mozilor' is already used…") instead of a bare 409.
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body && typeof body.detail === "string") {
+        message = body.detail;
+      } else if (Array.isArray(body?.detail) && body.detail[0]?.msg) {
+        // Pydantic validation errors come back as an array of dicts.
+        message = body.detail.map((d: { msg: string }) => d.msg).join("; ");
+      }
+    } catch {
+      // body wasn't JSON — fall through to the status text
+    }
+    throw new Error(message);
+  }
   if (res.status === 204) return undefined as T;
   return res.json();
 }
@@ -268,6 +295,64 @@ export const api = {
       body: JSON.stringify({ message }),
     }),
 
+  /**
+   * Streaming variant of `ask`. Calls `onEvent` repeatedly as the backend
+   * emits SSE events (text deltas, tool calls, the final done event). Returns
+   * a Promise that resolves when the stream finishes or an error occurs.
+   *
+   * Pattern: the answer is built up by appending each {type: "text", delta}
+   * chunk to the current message; the {type: "done", tool_calls} arrives last.
+   */
+  askStream: async (
+    message: string,
+    onEvent: (event: {
+      type: "text" | "tool" | "done" | "error";
+      delta?: string;
+      name?: string;
+      tool_calls?: AgentRun["tool_calls"];
+    }) => void,
+  ): Promise<void> => {
+    const token = getToken();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    if (API_BASE) headers["ngrok-skip-browser-warning"] = "true";
+
+    const res = await fetch(`${API_BASE}/api/ask/stream`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ message }),
+    });
+    if (res.status === 401) {
+      clearToken();
+      window.location.reload();
+      throw new Error("Unauthorized");
+    }
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.body) throw new Error("No response body for streaming");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE messages are separated by \n\n. Parse complete messages, keep partial in buffer.
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          onEvent(event);
+        } catch {
+          // Ignore malformed events — the stream might be ending or have a stray heartbeat
+        }
+      }
+    }
+  },
+
   features: (status?: string) =>
     http<Feature[]>(`/api/features${status ? `?status=${encodeURIComponent(status)}` : ""}`),
 
@@ -321,6 +406,15 @@ export const api = {
       new_projects: string[];
       deleted_projects: string[];
       error?: string;
+      accounts: {
+        account_id: number;
+        account_label: string;
+        synced: number;
+        new_projects: string[];
+        deleted_projects: string[];
+        error?: string;
+        status?: "ok" | "auth_failed" | "not_found" | "unreachable" | "error";
+      }[];
     }>("/api/projects/sync", { method: "POST" }),
 
   jiraAccounts: {

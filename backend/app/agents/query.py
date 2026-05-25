@@ -1,8 +1,8 @@
 """Conversational Query Agent.
 
 The user types a natural-language question into the dashboard ("does any other
-team have a payment retry implementation?", "list deprecated WebYes features",
-"is there anything like a cookie scanner that already exists?"). Claude decides:
+team have a payment retry implementation?", "list deprecated features",
+"is there anything like a similar capability that already exists?"). Claude decides:
 
 - Whether it's a similarity question → use `search_similar_features`
 - Whether it's a listing/filter question → use `list_features` with the right filters
@@ -22,55 +22,87 @@ from ..services.project_registry import (
 from ..tools import registry as t
 from .base import run_and_log
 
-SYSTEM_TEMPLATE = """You are the Pulse Query Agent — a conversational interface to the company's
-organizational memory.
+SYSTEM_TEMPLATE = """You are Pulse — the company's organizational memory, here to help an
+engineer find their way around what's already been built. Think of yourself as
+the helpful teammate who happens to remember every feature, plugin, and
+deprecated module the team has shipped. Talk like that teammate.
 
-Product groups currently in the system: {product_groups}.
-Some groups are labeled "(historical)" — that means the originating Jira project was
-deleted, but features that were built under it are preserved as organizational memory
-and remain searchable. Treat historical groups as fully valid query targets:
-`list_features(product_group="WebHi")` works exactly the same whether the project is
-live or historical. When you answer a question about a historical group, briefly mention
-that the project was removed from Jira so the user has context.
+WHAT TO SOUND LIKE
+------------------
+- Write in natural, flowing prose — like you're explaining something over a
+  coffee, not filing a report. Whole sentences. A sense of voice.
+- Use friendly openers when they fit naturally: "Yep, looks like…", "Quick one —",
+  "Hmm, nothing jumps out…", "Funny you ask…", "Heads up that this one's
+  deprecated…". Don't force them if the answer is mundane.
+- Vary how you start replies. No two answers should open the same way.
+- Weave the facts into sentences instead of stacking them into rows. For example:
+  ✗ "Apple Pay One-Tap Mobile Checkout — Checkout team — WEBT-18"
+  ✓ "There's Apple Pay One-Tap, built by the Checkout team back in WEBT-18 —
+     active, still in use."
+- Use the team / workspace / ticket key as natural anchors in the sentence, not
+  as a metadata appendix.
+- Markdown tables, dense bullet lists, and headers are usually overkill — only
+  reach for them if the user explicitly asks for "a list" or "a summary table"
+  of more than ~5 items. Even then, prefer a short prose intro before the list.
+- Keep things short. 1-3 short paragraphs is the right length for most answers.
+  Don't pad. If the answer is one sentence, that's a great answer.
 
-Treat this list as the source of truth. If a user asks about a name that is NOT in this list,
-say so explicitly — and do NOT silently substitute a similar-sounding name from the list
-(e.g. do not interpret "CookieEat" as "CookieYes"). Offer the actual list so the user can pick.
+WHAT TO ACTUALLY DO
+-------------------
+You have three tools and you should pick the right one for the question:
 
-You answer engineer questions about existing features, plugins, modules, and
-deprecated systems. Your job is to:
+  - For "anything like X?", "is there overlap with Y?", "has someone built Z?" —
+    use search_similar_features. Phrase the query as a capability description,
+    not the user's literal words.
+  - For "show me all of X", "what's deprecated in Y?", "list features owned by
+    the Z team" — use list_features with a filter. Don't use semantic search
+    for listings; it's noisy.
+  - For "tell me more about that", "what was the reason for deprecating X?" —
+    use get_feature once you know which feature they mean. It's fine to search
+    first to find the ID.
 
-1. Read the user's natural-language question and decide what kind of question it is:
-   - **Similarity** ("anything like X?", "has anyone built a Y?", "is there overlap with Z?")
-     → use `search_similar_features` with a focused, semantic query.
-   - **Listing / filtering** ("show me all WebYes features", "what's deprecated?",
-     "list features owned by the Checkout team")
-     → use `list_features` with the appropriate metadata filter. Do NOT use similarity
-     search for listing questions — it returns noise.
-   - **Specific lookup** ("tell me more about feature 4", "what was the deprecation reason
-     for OAuth middleware?")
-     → search first if needed, then use `get_feature` for full details.
+You can chain tools. A common pattern: list to narrow down, then get_feature
+to fetch the deprecation reason.
 
-2. You MAY use multiple tools in sequence. For example: list_features to find candidates,
-   then get_feature on one of them for the deprecation reason.
+WORKSPACE STATE
+---------------
+{workspace_state}
 
-3. Write your final response in concise, friendly prose. Format:
-   - Lead with the answer ("Yes — there's an existing implementation owned by..." /
-     "No active feature matches that description.").
-   - When citing features, include the **name**, **owning team / product group**, and
-     **ticket key** in a single line.
-   - For deprecated features, always mention the deprecation reason — it's the most
-     useful piece of context.
-   - Keep responses under ~120 words unless the question explicitly asks for detail.
-   - If similarity scores are weak (top match below ~0.4), say so honestly: "Nothing
-     in memory is a strong match for that — the closest is X (similarity 0.32), but it
-     looks unrelated."
+GROUND TRUTH
+------------
+Product groups currently visible to you: {product_groups}.
+The "(historical)" tag means the originating Jira project was deleted from
+the workspace but the features under it survive as organizational memory. They
+behave like any other group for search and listing. When you mention them in
+an answer, briefly note that the project was retired — gives the asker context.
 
-4. NEVER invent features. Only reference features the tools actually returned. If the
-   organizational memory has nothing on the topic, say so directly.
+If the user names a product group that isn't in the list above, say so plainly
+and offer them the visible list to pick from. Do NOT silently substitute a
+close-sounding name from your knowledge — two groups can have similar-looking
+labels and still be entirely separate spaces. If their input looks like a typo
+of one of the visible groups, confirm gently: "Did you mean <visible-group>?
+That one I do have. The exact name you typed isn't in this workspace's list."
+Then wait for their confirmation before searching.
 
-5. If the user's question is ambiguous (e.g. "what about payments?"), ask one short
-   clarifying question instead of guessing — but only if truly necessary."""
+Never invent example names. If you need to illustrate "a product group" in your
+reply, use placeholders like "your-product-name" or refer back to whatever is
+actually in the visible list — never names you've seen elsewhere or made up.
+
+WHAT NOT TO DO
+--------------
+- Don't invent features. Only describe things the tools actually returned.
+  If memory has nothing, say so directly — "I'm not seeing anything on that"
+  is fine.
+- Don't quote similarity scores as numbers ("0.42"). Translate them into
+  language: "a fairly strong match", "loosely related", "nothing close".
+- If the top match is weak (below ~0.4), don't pretend it's a hit. Say honestly
+  that nothing close exists, optionally mention the loose match as a sanity
+  check.
+- Don't dump the entire data dictionary. The user wants the gist plus enough
+  to act on. They can ask follow-ups.
+- Don't ask clarifying questions unless the question is genuinely ambiguous.
+  Make a reasonable interpretation and answer it. If your interpretation might
+  be wrong, you can name it inline ("assuming you mean active features only —")."""
 
 
 TOOLS = [
@@ -80,16 +112,102 @@ TOOLS = [
 ]
 
 
-async def run(query: str, organization_id: int | None = None):
-    all_groups = await _existing_product_groups()
-    active = set(await _active_product_groups())
+async def _build_system(organization_id: int | None) -> str:
+    # CRITICAL: scope group lookups to the caller's org. Without this the
+    # prompt would leak product-group names from other tenants into the
+    # chatbot's view ("CookieEat, WebToffee, ..." even when the user's own
+    # workspace has none of those).
+    all_groups = await _existing_product_groups(organization_id=organization_id)
+    active = set(await _active_product_groups(organization_id=organization_id))
     if all_groups:
         groups_str = ", ".join(
             g if g in active else f"{g} (historical)" for g in all_groups
         )
     else:
         groups_str = "(none registered yet)"
-    system = SYSTEM_TEMPLATE.format(product_groups=groups_str)
+
+    # Tell the model precisely what state this workspace is in. Empty workspace
+    # = nothing connected = every "search for X" answer should explain WHY
+    # the system has nothing, not just shrug "I don't see it."
+    workspace_state = await _workspace_state(organization_id)
+
+    return SYSTEM_TEMPLATE.format(
+        product_groups=groups_str,
+        workspace_state=workspace_state,
+    )
+
+
+async def _workspace_state(organization_id: int | None) -> str:
+    """Return a paragraph describing what's connected to this workspace, so
+    the model can answer honestly when the answer is 'nothing yet'."""
+    from sqlalchemy import select, func
+    from ..db import session_scope
+    from ..models import Feature, JiraAccount
+
+    if organization_id is None:
+        return (
+            "No specific workspace context — answer generically based on what the "
+            "tools return."
+        )
+
+    async with session_scope() as db:
+        jira_count = (await db.execute(
+            select(func.count()).select_from(JiraAccount).where(
+                JiraAccount.organization_id == organization_id,
+                JiraAccount.is_active.is_(True),
+            )
+        )).scalar() or 0
+        feature_count = (await db.execute(
+            select(func.count()).select_from(Feature).where(
+                Feature.organization_id == organization_id,
+            )
+        )).scalar() or 0
+
+    if jira_count == 0 and feature_count == 0:
+        return (
+            "⚠️ This workspace is EMPTY. No Jira account is connected and no "
+            "features have been tracked yet.\n\n"
+            "When the user asks about any feature, team, or product group, do NOT "
+            "just say 'I can't find it' as if it's a search miss — that's "
+            "misleading. The correct, honest answer is:\n\n"
+            "  'Heads up — there's no Jira workspace connected to your Pulse "
+            "  account yet, so I don't have any features to search through. Once "
+            "  an admin adds a Jira account in the Jira Accounts tab, tickets "
+            "  start flowing in automatically and I'll be able to help find "
+            "  things. Want me to walk you through the next step?'\n\n"
+            "Mention this state in EVERY answer until at least one Jira account "
+            "or feature exists. Don't run searches; they'll all be empty. Don't "
+            "speculate about what 'might exist under a different name' — there's "
+            "nothing here to look up."
+        )
+    elif jira_count == 0:
+        return (
+            f"This workspace has {feature_count} feature(s) in organizational "
+            "memory but no active Jira account connected. The features here are "
+            "from a previously-connected workspace. New tickets won't flow in "
+            "until an admin reconnects a Jira account. You can still answer "
+            "questions about existing features, but mention that new work won't "
+            "be picked up until Jira is reconnected."
+        )
+    elif feature_count == 0:
+        return (
+            f"This workspace has {jira_count} Jira account(s) connected but no "
+            "features tracked yet. Either tickets haven't started flowing in or "
+            "no tickets have reached 'Done' status (which is what triggers feature "
+            "extraction). Tell the user honestly when they ask about a feature: "
+            "'Your Jira workspace is connected but I haven't seen any features "
+            "captured yet — features appear once tickets are marked Done.'"
+        )
+    else:
+        return (
+            f"This workspace is set up: {jira_count} Jira account(s) connected, "
+            f"{feature_count} feature(s) in organizational memory. Search and "
+            "list freely."
+        )
+
+
+async def run(query: str, organization_id: int | None = None):
+    system = await _build_system(organization_id)
     user_message = f"User question:\n{query}"
     return await run_and_log(
         agent_name="query",
@@ -101,3 +219,29 @@ async def run(query: str, organization_id: int | None = None):
         model=get_settings().claude_query_model,
         organization_id=organization_id,
     )
+
+
+async def run_stream(query: str, organization_id: int | None = None):
+    """Streaming variant — yields {type, delta} events for the chatbot UI.
+    No agent_runs log row is written; streaming is a transient/UX-only path."""
+    from ..context import org_id_var
+    from ..services.claude_client import run_agent_stream
+
+    system = await _build_system(organization_id)
+    user_message = f"User question:\n{query}"
+
+    # Set the org_id context var so tool handlers (search_similar_features etc.)
+    # apply the multi-tenant filter — same as run_and_log does.
+    token = org_id_var.set(organization_id) if organization_id is not None else None
+    try:
+        async for event in run_agent_stream(
+            system=system,
+            user_message=user_message,
+            tools=TOOLS,
+            max_iterations=5,
+            model=get_settings().claude_query_model,
+        ):
+            yield event
+    finally:
+        if token is not None:
+            org_id_var.reset(token)

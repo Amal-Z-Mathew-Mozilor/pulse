@@ -17,5 +17,6 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.12
 cryptography>=42.0.0
-arq>=0.26.0
-redis>=5.0.0
+procrastinate>=3.0.0
+psycopg[binary]>=3.2.0
+pgvector>=0.4.0

@@ -58,6 +58,9 @@ export default function App() {
   const [notifs, setNotifs] = useState<NotificationState>(EMPTY_NOTIFS);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // "checking" = initial (no pill), "ok" = connected (no pill),
+  // "offline" = at least one failure after first success (show pill).
+  const [conn, setConn] = useState<"checking" | "ok" | "offline">("checking");
 
   // Validate stored token on mount
   useEffect(() => {
@@ -100,6 +103,9 @@ export default function App() {
       try {
         const statusHeaders: Record<string, string> = {};
         if (API_BASE) statusHeaders["ngrok-skip-browser-warning"] = "true";
+        // /api/status is now auth-required (org-scoped). Send the JWT.
+        const token = getToken();
+        if (token) statusHeaders["Authorization"] = `Bearer ${token}`;
         const r = await fetch(API_BASE + "/api/status", { headers: statusHeaders });
 
         if (!r.ok) {
@@ -110,17 +116,20 @@ export default function App() {
 
         if (!cancelled) {
           setStatus(data);
+          setConn("ok");
         }
       } catch {
         if (!cancelled) {
-          setStatus(null);
+          // Keep the last-known-good status visible. Only flip the connection
+          // pill once we've actually tried at least once.
+          setConn((prev) => (prev === "checking" ? "offline" : "offline"));
         }
       }
     }
 
     load();
 
-    const t = setInterval(load, 10_000);
+    const t = setInterval(load, 30_000);
 
     return () => {
       cancelled = true;
@@ -174,7 +183,7 @@ export default function App() {
 
     tick();
 
-    const t = setInterval(tick, 8_000);
+    const t = setInterval(tick, 30_000);
 
     return () => {
       cancelled = true;
@@ -228,6 +237,7 @@ export default function App() {
             <div
               key={t.id}
               className={`nav-item ${isActive ? "active" : ""}`}
+              data-tab={t.id}
               onClick={() => selectTab(t.id, t.section)}
             >
               <span>{t.label}</span>
@@ -245,66 +255,41 @@ export default function App() {
         })}
 
         {status && (
-          <div
-            style={{
-              marginTop: 28,
-              fontSize: 11,
-              color: "var(--muted)",
-              lineHeight: 1.7,
-            }}
-          >
-            <div>Model: {status.model}</div>
-
-            <div>
-              Claude API:{" "}
-              {status.anthropic_configured ? "✓ live" : "✗ stub mode"}
+          <div className="sidebar-status">
+            <div className="sidebar-status-row">
+              <span className="label">Model</span>
+              <span className="value" title={status.model}>{status.model.replace("claude-", "")}</span>
             </div>
-
-            <div>
-              Embeddings:{" "}
-              {status.local_embeddings_available
-                ? "✓ local (MiniLM)"
-                : "✗ hash fallback"}
+            <div className="sidebar-status-row">
+              <span className="label">Claude</span>
+              <span className={`value ${status.anthropic_configured ? "ok" : "bad"}`}>
+                {status.anthropic_configured ? "live" : "stub"}
+              </span>
             </div>
-
-            <div>
-              Vector store:{" "}
-              {status.vector_store === "pinecone"
-                ? "✓ Pinecone"
-                : "in-memory"}
+            <div className="sidebar-status-row">
+              <span className="label">Vectors</span>
+              <span className="value ok">pgvector</span>
             </div>
-
-            <div>
-              Jira: {status.jira_configured
-                ? `✓ ${status.jira_account_count ?? 1} account${(status.jira_account_count ?? 1) === 1 ? "" : "s"}`
-                : "✗ not configured"}
+            <div className="sidebar-status-row">
+              <span className="label">Jira</span>
+              <span className={`value ${status.jira_configured ? "ok" : "bad"}`}>
+                {status.jira_configured
+                  ? `${status.jira_account_count ?? 1} acct${(status.jira_account_count ?? 1) === 1 ? "" : "s"}`
+                  : "off"}
+              </span>
             </div>
-
-            <div>
-              Webhook secret:{" "}
-              {status.jira_webhook_secured ? "✓ set" : "✗ unset"}
+            <div className="sidebar-status-row">
+              <span className="label">Webhook</span>
+              <span className={`value ${status.jira_webhook_secured ? "ok" : "bad"}`}>
+                {status.jira_webhook_secured ? "secured" : "unset"}
+              </span>
             </div>
           </div>
         )}
 
-        <div
-          style={{
-            marginTop: "auto",
-            paddingTop: 24,
-            borderTop: "1px solid var(--border)",
-          }}
-        >
-          <div
-            style={{
-              fontSize: 12,
-              color: "var(--muted)",
-              marginBottom: 8,
-            }}
-          >
-            {user.username}
-            {user.is_admin && " · admin"}
-          </div>
-
+        <div className="sidebar-user">
+          <div className="sidebar-user-name">{user.username}</div>
+          <div className="sidebar-user-role">{user.is_admin ? "Admin" : "Member"}</div>
           <button
             className="secondary"
             style={{ width: "100%", fontSize: 12 }}
@@ -316,19 +301,25 @@ export default function App() {
       </aside>
 
       <main className="main">
-        {status !== null && status.anthropic_configured === false && (
+        {status !== null && status.anthropic_configured === false && user.is_admin && (
+          // Admin-only banner — customers shouldn't see infrastructure jargon.
+          // Stub mode is a setup state that only the org admin needs to act on.
           <div className="banner warn">
-            <strong>Stub mode:</strong> no ANTHROPIC_API_KEY set. Agents will
-            use a deterministic substitute — the pipeline runs end-to-end but
-            reasoning quality is limited.
+            <strong>Setup incomplete:</strong> Pulse can't connect to its AI provider.
+            The agents will use a placeholder response until this is fixed —
+            ask your administrator to complete the setup.
           </div>
         )}
 
-        {status === null && (
-          <div className="banner warn">
-            <strong>Backend status unavailable.</strong> Pulse can't reach{" "}
-            <code>{API_BASE || "localhost:8000"}</code> — make sure uvicorn is running and your
-            Vercel URL is in <code>CORS_ORIGINS</code>.
+        {conn === "offline" && (
+          <div
+            className="connection-pill"
+            role="status"
+            aria-live="polite"
+            title="Pulse will keep trying automatically"
+          >
+            <span className="connection-dot" />
+            <span>Reconnecting to Pulse…</span>
           </div>
         )}
 

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .db import init_db
 from .dependencies import get_current_user
+from .models import User
 from .routes import alerts, features, jira_accounts, projects, search, webhooks
 from .routes import auth as auth_router
 from .services.jira_client import close_jira_client
@@ -87,34 +88,11 @@ async def lifespan(app: FastAPI):
     elif settings_local.has_jira:
         boot_log.info("Jira credentials present but no JiraAccount rows yet — bootstrap will seed default on next init_db pass")
 
+    # Vectors live in the features.embedding column (pgvector), so they're
+    # durable across restarts — no rehydration needed. Probe the store so we
+    # fail fast if pgvector isn't installed in the connected database.
     store = get_store()
-    if is_pinecone_active():
-        # Pinecone is durable — don't rehydrate every restart. Existing index
-        # already has the vectors. Newly-stored features will be upserted on the fly.
-        logging.getLogger(__name__).info("Pinecone active — skipping rehydration")
-    else:
-        # In-memory store is ephemeral, so rebuild it from SQLite on every boot.
-        async with session_scope() as db:
-            rows = (await db.execute(select(Feature))).scalars().all()
-            for f in rows:
-                text = f"{f.name}\n{f.summary}"
-                if f.status == "deprecated" and f.deprecation_reason:
-                    text += f"\n[DEPRECATED] {f.deprecation_reason}"
-                store.upsert_text(
-                    id=f"feature:{f.id}",
-                    text=text,
-                    metadata={
-                        "feature_id": f.id,
-                        "name": f.name,
-                        "summary": f.summary,
-                        "team": f.team,
-                        "product_group": f.product_group,
-                        "status": f.status,
-                        "deprecation_reason": f.deprecation_reason,
-                        "ticket_key": f.ticket_key,
-                    },
-                )
-        logging.getLogger(__name__).info("in-memory vector store hydrated with %d features", store.size())
+    boot_log.info("pgvector store ready — %d feature(s) currently indexed", store.size())
 
     poll_task: asyncio.Task | None = None
     if active_accounts and settings_local.jira_project_sync_interval_seconds > 0:
@@ -122,28 +100,24 @@ async def lifespan(app: FastAPI):
             _jira_project_sync_loop(settings_local.jira_project_sync_interval_seconds)
         )
 
-    # Arq pool — webhook handlers enqueue jobs onto this. Created here once at
-    # startup and stored on app.state so route handlers can reach it via
-    # `request.app.state.arq`. If REDIS_URL isn't set or the connection fails,
-    # we leave it as None and the dispatcher falls back to BackgroundTasks.
-    app.state.arq = None
-    if settings_local.has_redis:
-        try:
-            from arq import create_pool
-            from arq.connections import RedisSettings
-            app.state.arq = await create_pool(RedisSettings.from_dsn(settings_local.redis_url))
-            boot_log.info("Arq pool connected — webhook events route through Redis queue")
-        except Exception as exc:
-            boot_log.warning(
-                "Arq pool init failed (%s) — webhooks will use FastAPI BackgroundTasks instead. "
-                "Make sure Redis is reachable at %s.",
-                exc, settings_local.redis_url,
-            )
-            app.state.arq = None
-    else:
-        boot_log.info(
-            "REDIS_URL not set — webhooks will use FastAPI BackgroundTasks "
-            "(fine for dev, lossy on restart, no retries)."
+    # Procrastinate queue — webhook handlers defer jobs into the
+    # `procrastinate_jobs` Postgres table via this app. Stored on
+    # app.state.queue so route handlers reach it via `request.app.state.queue`.
+    # If the connector can't open (no DB, missing schema, etc.) we leave it as
+    # None and the dispatcher falls back to FastAPI BackgroundTasks.
+    app.state.queue = None
+    try:
+        from .worker import app as queue_app
+        # Open the connection pool so defer_async works from the API process.
+        # The worker process opens its own pool independently.
+        await queue_app.open_async()
+        app.state.queue = queue_app
+        boot_log.info("Procrastinate queue connected — webhook events route through Postgres")
+    except Exception as exc:
+        boot_log.warning(
+            "Procrastinate init failed (%s) — webhooks will use FastAPI BackgroundTasks "
+            "(fine for dev, lossy on restart, no retries).",
+            exc,
         )
 
     try:
@@ -155,9 +129,9 @@ async def lifespan(app: FastAPI):
                 await poll_task
             except asyncio.CancelledError:
                 pass
-        if app.state.arq is not None:
+        if app.state.queue is not None:
             try:
-                await app.state.arq.close()
+                await app.state.queue.close_async()
             except Exception:
                 pass
         await close_jira_client()
@@ -194,22 +168,46 @@ app = FastAPI(title="Pulse — Organizational Memory", version="0.1.0", lifespan
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    # Also allow any Vercel preview deployment of the pulse-frontend project.
+    # Vercel creates a unique URL per build like:
+    #   pulse-frontend-<hash>-<team>.vercel.app
+    # Listing every one in CORS_ORIGINS is impractical — match by pattern instead.
+    allow_origin_regex=r"https://pulse-frontend-[a-z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-async def _status_payload():
+async def _public_status_payload():
+    """Unauthenticated minimum status — only global capability flags, never
+    tenant data. Used by the `/` health check and CI probes."""
     from .services.embeddings import is_local_model_available
+
+    queue_state = getattr(app.state, "queue", None)
+    queue_mode = "procrastinate" if queue_state is not None else "background_tasks"
+
+    return {
+        "name": "pulse",
+        "anthropic_configured": settings.has_anthropic,
+        "local_embeddings_available": is_local_model_available(),
+        "vector_store": "pgvector",
+        "queue_mode": queue_mode,
+        "model": settings.claude_model,
+    }
+
+
+async def _status_payload_for(user):
+    """Authenticated, org-scoped status. Returns the caller's own Jira accounts
+    only — never another tenant's labels, base_urls, or secrets."""
     from .services.jira_accounts import list_accounts
-    from .services.vector_store import is_pinecone_active
 
-    arq_state = getattr(app.state, "arq", None)
-    queue_mode = "arq" if arq_state is not None else "background_tasks"
+    base = await _public_status_payload()
 
-    accounts = await list_accounts(active_only=False)
-    # Surface a compact per-account view — never the credentials themselves.
+    # Org-scoped Jira account view — only the caller's accounts.
+    accounts = await list_accounts(
+        active_only=False, organization_id=user.organization_id
+    )
     accounts_view = [
         {
             "id": a.id,
@@ -226,41 +224,33 @@ async def _status_payload():
     if primary_base_url is None and accounts:
         primary_base_url = accounts[0].base_url
 
-    return {
-        "name": "pulse",
-        "anthropic_configured": settings.has_anthropic,
-        "local_embeddings_available": is_local_model_available(),
-        "vector_store": "pinecone" if is_pinecone_active() else "in-memory",
+    base.update({
         # Legacy single-account fields — kept so the frontend status banner keeps working.
         "jira_configured": active_count > 0,
         "jira_webhook_secured": any(a.webhook_secret for a in accounts if a.is_active),
         "jira_base_url": primary_base_url,
-        # Multi-account view.
+        # Multi-account view, scoped to this org.
         "jira_accounts": accounts_view,
         "jira_account_count": active_count,
-        # Public-facing base URL of this Pulse backend — frontend uses this to
-        # render the full per-account webhook URL. Empty if PULSE_PUBLIC_BASE_URL
-        # isn't set in .env; the UI degrades to showing just the path.
+        # Public-facing base URL of THIS Pulse backend — frontend uses it to
+        # render the full per-account webhook URL.
         "public_base_url": settings.pulse_public_base_url.rstrip("/") or None,
-        # Which dispatch backend is wired up — "arq" means durable + retryable
-        # via Redis; "background_tasks" means fire-and-forget within this
-        # uvicorn process (dev mode).
-        "queue_mode": queue_mode,
-        "model": settings.claude_model,
-    }
+    })
+    return base
 
 
 @app.get("/")
 async def root():
-    """Kept for direct backend checks (curl etc.) — same payload as /api/status."""
-    return await _status_payload()
+    """Public health check — global capabilities only, no tenant data."""
+    return await _public_status_payload()
 
 
 @app.get("/api/status")
-async def api_status():
-    """Same payload as `/`, exposed under /api/* so the Vite dev-server proxy
-    picks it up — avoids cross-origin CORS issues from the React frontend."""
-    return await _status_payload()
+async def api_status(current_user: User = Depends(get_current_user)):
+    """Org-scoped status — returns the caller's own workspace info plus the
+    global capability flags. Auth-required so we don't leak Jira-account
+    labels/base_urls across tenants."""
+    return await _status_payload_for(current_user)
 
 
 # Auth routes are public — no JWT dependency

@@ -28,20 +28,49 @@ export default function SearchPanel() {
   async function send(message: string) {
     const trimmed = message.trim();
     if (!trimmed || loading) return;
-    setTurns((t) => [...t, { role: "user", content: trimmed }]);
+    // Insert the user's turn and a fresh assistant turn we'll stream into.
+    setTurns((t) => [
+      ...t,
+      { role: "user", content: trimmed },
+      { role: "assistant", content: "" },
+    ]);
     setInput("");
     setLoading(true);
     try {
-      const result = await api.ask(trimmed);
-      setTurns((t) => [
-        ...t,
-        { role: "assistant", content: result.response, tool_calls: result.tool_calls },
-      ]);
+      await api.askStream(trimmed, (event) => {
+        if (event.type === "text" && event.delta) {
+          // Append the new chunk to the last (assistant) turn.
+          setTurns((t) => {
+            const next = [...t];
+            const last = next[next.length - 1];
+            if (last && last.role === "assistant") {
+              next[next.length - 1] = { ...last, content: last.content + event.delta };
+            }
+            return next;
+          });
+        } else if (event.type === "done" && event.tool_calls) {
+          setTurns((t) => {
+            const next = [...t];
+            const last = next[next.length - 1];
+            if (last && last.role === "assistant") {
+              next[next.length - 1] = { ...last, tool_calls: event.tool_calls };
+            }
+            return next;
+          });
+        }
+      });
     } catch (e) {
-      setTurns((t) => [
-        ...t,
-        { role: "assistant", content: `Error: ${e instanceof Error ? e.message : String(e)}` },
-      ]);
+      setTurns((t) => {
+        const next = [...t];
+        const last = next[next.length - 1];
+        const errMsg = `Error: ${e instanceof Error ? e.message : String(e)}`;
+        if (last && last.role === "assistant" && !last.content) {
+          next[next.length - 1] = { ...last, content: errMsg };
+        } else {
+          next.push({ role: "assistant", content: errMsg });
+        }
+        return next;
+      });
     } finally {
       setLoading(false);
     }
@@ -128,7 +157,7 @@ export default function SearchPanel() {
           </div>
         ))}
 
-        {loading && (
+        {loading && turns[turns.length - 1]?.role === "assistant" && !turns[turns.length - 1]?.content && (
           <div className="muted" style={{ padding: "10px 14px" }}>
             <em>Pulse is thinking…</em>
           </div>

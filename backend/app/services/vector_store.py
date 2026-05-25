@@ -1,22 +1,31 @@
-"""Vector store layer.
+"""Vector store backed by Postgres + pgvector.
 
-Two implementations behind one interface:
+We store one embedding per Feature row, in the `embedding` column. Semantic
+search runs as a SQL query: `ORDER BY embedding <=> :query_vector LIMIT N`,
+optionally filtered by columns on the same row (organization_id, status,
+product_group, etc.). This means:
 
-- `PineconeVectorStore` — real Pinecone serverless index. Auto-creates the index
-  on first run with the right dimension (matches MiniLM = 384) and cosine metric.
-- `InMemoryVectorStore` — Python dict + brute-force cosine. Used when
-  `PINECONE_API_KEY` isn't set so the demo still runs without a Pinecone account.
+  - No separate vector database (Pinecone) — features and their vectors live
+    in the same row, atomic, multi-tenant-safe.
+  - Multi-tenant filters are regular SQL `WHERE` clauses on the features
+    table — impossible to forget.
+  - The HNSW index gives sub-10ms queries up to hundreds of thousands of
+    vectors, which is way beyond Pulse's scale.
 
-`get_store()` picks one based on settings. Same upsert/query/delete signature so
-nothing else in the codebase needs to know which is active.
+The public API is kept identical to the old InMemory/Pinecone interface so
+existing callers (tools/registry.py, restore_feature, etc.) keep working.
+The id format is `feature:{int}` — anything that doesn't match is ignored.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
+
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
 
 from ..config import get_settings
 from . import embeddings as emb
@@ -40,137 +49,73 @@ class VectorStore(Protocol):
     def size(self) -> int: ...
 
 
-# ---------- In-memory implementation (fallback) ----------
+# ---------- pgvector implementation ----------
 
-class InMemoryVectorStore:
-    def __init__(self) -> None:
-        self._vectors: dict[str, list[float]] = {}
-        self._metadata: dict[str, dict[str, Any]] = {}
-        self._lock = threading.Lock()
-
-    def upsert(self, id: str, vector: list[float], metadata: dict[str, Any] | None = None) -> None:
-        with self._lock:
-            self._vectors[id] = vector
-            self._metadata[id] = metadata or {}
-
-    def upsert_text(self, id: str, text: str, metadata: dict[str, Any] | None = None) -> None:
-        vector = emb.embed_one(text, input_type="document")
-        self.upsert(id, vector, metadata)
-
-    def delete(self, id: str) -> None:
-        with self._lock:
-            self._vectors.pop(id, None)
-            self._metadata.pop(id, None)
-
-    def query(
-        self,
-        vector: list[float],
-        top_k: int = 5,
-        filter: dict[str, Any] | None = None,
-    ) -> list[VectorMatch]:
-        with self._lock:
-            items = list(self._vectors.items())
-            metadata_snapshot = dict(self._metadata)
-
-        results: list[VectorMatch] = []
-        for vid, vec in items:
-            meta = metadata_snapshot.get(vid, {})
-            if filter and not _matches_filter(meta, filter):
-                continue
-            score = emb.cosine(vector, vec)
-            results.append(VectorMatch(id=vid, score=score, metadata=meta))
-        results.sort(key=lambda m: m.score, reverse=True)
-        return results[:top_k]
-
-    def query_text(self, text: str, top_k: int = 5, filter: dict[str, Any] | None = None) -> list[VectorMatch]:
-        vector = emb.embed_one(text, input_type="query")
-        return self.query(vector, top_k=top_k, filter=filter)
-
-    def size(self) -> int:
-        return len(self._vectors)
-
-
-def _matches_filter(meta: dict[str, Any], filter: dict[str, Any]) -> bool:
-    for k, v in filter.items():
-        if isinstance(v, dict) and "$in" in v:
-            if meta.get(k) not in v["$in"]:
-                return False
-        elif meta.get(k) != v:
-            return False
-    return True
-
-
-# ---------- Pinecone implementation ----------
-
-class PineconeVectorStore:
-    """Wraps a Pinecone serverless index. The MiniLM model emits 384-dim vectors;
-    the index is auto-created with that dimension and cosine metric the first time."""
-
-    DIMENSION = 384  # matches sentence-transformers/all-MiniLM-L6-v2
+class PgVectorStore:
+    """Vectors live in `features.embedding`. We don't need an `id ↔ vector` map
+    because the Feature primary key IS the vector's identity."""
 
     def __init__(self) -> None:
-        from pinecone import Pinecone, ServerlessSpec
-
-        settings = get_settings()
-        self._pc = Pinecone(api_key=settings.pinecone_api_key)
-        self._index_name = settings.pinecone_index
-
-        existing = {ix["name"]: ix for ix in self._pc.list_indexes()}
-        if self._index_name not in existing:
-            log.info("Pinecone: creating index %s (dim=%d, metric=cosine, %s/%s)",
-                     self._index_name, self.DIMENSION, settings.pinecone_cloud, settings.pinecone_region)
-            self._pc.create_index(
-                name=self._index_name,
-                dimension=self.DIMENSION,
-                metric="cosine",
-                spec=ServerlessSpec(cloud=settings.pinecone_cloud, region=settings.pinecone_region),
-            )
+        # Build a sync DSN from DATABASE_URL. Strip the +asyncpg driver tag —
+        # psycopg uses the standard libpq URL.
+        url = get_settings().database_url
+        if url.startswith("postgresql+asyncpg://"):
+            self._dsn = url.replace("postgresql+asyncpg://", "postgresql://", 1)
         else:
-            # Validate the pre-existing index matches our embedding dimension. Otherwise
-            # every upsert will 400 with "Vector dimension X does not match the dimension
-            # of the index Y" — better to fail fast at startup with a clear message.
-            ix_dim = existing[self._index_name].get("dimension")
-            if ix_dim and int(ix_dim) != self.DIMENSION:
-                raise RuntimeError(
-                    f"Pinecone index '{self._index_name}' has dimension {ix_dim}, but "
-                    f"this app embeds at dimension {self.DIMENSION} (MiniLM). "
-                    f"Either delete the index in the Pinecone console and let the app "
-                    f"recreate it, or set PINECONE_INDEX to a fresh name in .env."
-                )
-        self._index = self._pc.Index(self._index_name)
-        log.info("Pinecone: connected to index %s", self._index_name)
+            self._dsn = url
+        # Probe — fail fast at boot if pgvector isn't available.
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname='vector'")
+                if cur.fetchone() is None:
+                    raise RuntimeError(
+                        "pgvector extension is not installed in this database. "
+                        "Run `CREATE EXTENSION vector;` in the SQL editor."
+                    )
+        log.info("PgVectorStore: connected, pgvector available")
+
+    def _connect(self):
+        # Each call returns a fresh connection. psycopg auto-closes on context exit.
+        # `prepare_threshold=None` disables psycopg's prepared-statement cache
+        # which is incompatible with PgBouncer transaction-mode pooling.
+        conn = psycopg.connect(self._dsn, prepare_threshold=None, autocommit=True)
+        register_vector(conn)
+        return conn
 
     @staticmethod
-    def _clean_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-        """Pinecone metadata values must be string, number, bool, or list[str].
-        Drop None values; coerce others where useful."""
-        if not metadata:
-            return {}
-        out: dict[str, Any] = {}
-        for k, v in metadata.items():
-            if v is None:
-                continue
-            if isinstance(v, (str, int, float, bool)):
-                out[k] = v
-            elif isinstance(v, list) and all(isinstance(x, str) for x in v):
-                out[k] = v
-            else:
-                out[k] = str(v)
-        return out
+    def _parse_feature_id(vid: str) -> int | None:
+        if not vid.startswith("feature:"):
+            return None
+        try:
+            return int(vid.split(":", 1)[1])
+        except ValueError:
+            return None
 
     def upsert(self, id: str, vector: list[float], metadata: dict[str, Any] | None = None) -> None:
-        self._index.upsert(vectors=[{
-            "id": id,
-            "values": vector,
-            "metadata": self._clean_metadata(metadata),
-        }])
+        fid = self._parse_feature_id(id)
+        if fid is None:
+            log.warning("PgVectorStore.upsert: ignoring unknown id format %s", id)
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE features SET embedding = %s WHERE id = %s",
+                    (vector, fid),
+                )
 
     def upsert_text(self, id: str, text: str, metadata: dict[str, Any] | None = None) -> None:
         vector = emb.embed_one(text, input_type="document")
         self.upsert(id, vector, metadata)
 
     def delete(self, id: str) -> None:
-        self._index.delete(ids=[id])
+        fid = self._parse_feature_id(id)
+        if fid is None:
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                # NULL out the embedding, but don't delete the Feature row —
+                # the row's deletion is owned by the application logic.
+                cur.execute("UPDATE features SET embedding = NULL WHERE id = %s", (fid,))
 
     def query(
         self,
@@ -178,18 +123,59 @@ class PineconeVectorStore:
         top_k: int = 5,
         filter: dict[str, Any] | None = None,
     ) -> list[VectorMatch]:
-        resp = self._index.query(
-            vector=vector,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter or None,
-        )
-        matches = []
-        for m in resp.matches:
+        # Filter dict supports plain `{col: value}` and `{col: {"$in": [...]}}` (Pinecone-style).
+        where_parts = ["embedding IS NOT NULL"]
+        params: list[Any] = []
+        for k, v in (filter or {}).items():
+            if k not in _ALLOWED_FILTER_COLS:
+                # Skip unknown filter keys silently — keeps backward compat with
+                # callers that pass extra metadata.
+                continue
+            if isinstance(v, dict) and "$in" in v:
+                vals = v["$in"]
+                if not vals:
+                    return []
+                where_parts.append(f"{k} = ANY(%s)")
+                params.append(list(vals))
+            else:
+                where_parts.append(f"{k} = %s")
+                params.append(v)
+        where_sql = " AND ".join(where_parts)
+
+        sql = f"""
+            SELECT id, name, summary, team, product_group, status,
+                   deprecation_reason, ticket_key, organization_id,
+                   (embedding <=> %s::vector) AS distance
+            FROM features
+            WHERE {where_sql}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """
+        # The query vector is needed twice — once for the SELECT distance, once for ORDER BY
+        # (Postgres won't reuse the calculation otherwise). pgvector accepts lists directly.
+        with self._connect() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, (vector, *params, vector, top_k))
+                rows = cur.fetchall()
+
+        matches: list[VectorMatch] = []
+        for r in rows:
+            # cosine distance is 0..2 where 0 = identical. Convert to similarity 1..-1.
+            similarity = 1.0 - float(r["distance"])
             matches.append(VectorMatch(
-                id=m.id,
-                score=float(m.score),
-                metadata=dict(m.metadata) if m.metadata else {},
+                id=f"feature:{r['id']}",
+                score=similarity,
+                metadata={
+                    "feature_id": r["id"],
+                    "name": r["name"],
+                    "summary": r["summary"],
+                    "team": r["team"],
+                    "product_group": r["product_group"],
+                    "status": r["status"],
+                    "deprecation_reason": r["deprecation_reason"],
+                    "ticket_key": r["ticket_key"],
+                    "organization_id": r["organization_id"],
+                },
             ))
         return matches
 
@@ -198,8 +184,23 @@ class PineconeVectorStore:
         return self.query(vector, top_k=top_k, filter=filter)
 
     def size(self) -> int:
-        stats = self._index.describe_index_stats()
-        return int(stats.total_vector_count or 0)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM features WHERE embedding IS NOT NULL")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+
+
+# Columns we allow as filters. Anything else gets ignored — prevents SQL
+# injection via untrusted filter keys and matches what the old metadata
+# filter supported.
+_ALLOWED_FILTER_COLS = {
+    "organization_id",
+    "status",
+    "product_group",
+    "team",
+    "ticket_key",
+}
 
 
 # ---------- factory ----------
@@ -211,18 +212,11 @@ def get_store() -> VectorStore:
     global _store
     if _store is not None:
         return _store
-    settings = get_settings()
-    if settings.has_pinecone:
-        try:
-            _store = PineconeVectorStore()
-            return _store
-        except Exception as exc:
-            log.warning("Pinecone init failed (%s) — falling back to in-memory store", exc)
-    _store = InMemoryVectorStore()
+    _store = PgVectorStore()
     return _store
 
 
 def is_pinecone_active() -> bool:
-    """Distinguishes 'asked for Pinecone and got it' from 'fell back to in-memory'."""
-    store = get_store()
-    return isinstance(store, PineconeVectorStore)
+    """Kept for back-compat with the status route — always False now that
+    Pinecone is gone."""
+    return False

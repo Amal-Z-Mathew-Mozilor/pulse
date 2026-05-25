@@ -33,6 +33,15 @@ export default function Changelog() {
             <span className={`badge ${f.status}`}>{f.status}</span>
             <span className="badge">{f.product_group}</span>
             {f.team && f.team !== "Unknown" && <span className="badge">{f.team}</span>}
+            {f.jira_account_label && (
+              <span
+                className="badge"
+                title={f.jira_base_url || undefined}
+                style={{ background: "rgba(91,140,255,0.12)", borderColor: "rgba(91,140,255,0.35)" }}
+              >
+                @ {f.jira_account_label}
+              </span>
+            )}
             <div className="spacer" />
             <span className="muted">{formatISTDateTime(f.updated_at)}</span>
           </div>

@@ -117,6 +117,15 @@ function RelatedFeatureCard({ rf }: { rf: RelatedFeature }) {
         <span className={`badge ${feature.status}`}>{feature.status}</span>
         {feature.product_group && <span className="badge">{feature.product_group}</span>}
         {feature.team && feature.team !== "Unknown" && <span className="badge">{feature.team}</span>}
+        {feature.jira_account_label && (
+          <span
+            className="badge"
+            title={feature.jira_base_url || undefined}
+            style={{ background: "rgba(91,140,255,0.12)", borderColor: "rgba(91,140,255,0.35)" }}
+          >
+            @ {feature.jira_account_label}
+          </span>
+        )}
       </div>
 
       {tier !== null && scorePct !== null && (

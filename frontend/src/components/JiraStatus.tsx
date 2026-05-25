@@ -23,7 +23,7 @@ export default function JiraStatus() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 4000);
+    const t = setInterval(load, 30_000);
     return () => clearInterval(t);
   }, []);
 
@@ -40,21 +40,37 @@ export default function JiraStatus() {
     setSyncMessage(null);
     try {
       const result = await api.syncProjects();
-      if (result.error) {
-        setSyncMessage(`Sync error: ${result.error}`);
+
+      // Build per-account feedback so we don't lie when one connection is broken.
+      const accounts = result.accounts || [];
+      const failed = accounts.filter((a) => a.error);
+      const succeeded = accounts.filter((a) => !a.error);
+
+      if (accounts.length === 0) {
+        // No active Jira accounts in this org — guide the user to connect one.
+        setSyncMessage("No Jira workspace is connected yet. Add one in Jira Accounts to start tracking projects.");
+      } else if (failed.length === accounts.length) {
+        // Every account failed — give the actual reason from the first one.
+        const a = failed[0];
+        setSyncMessage(`Couldn't reach “${a.account_label}”: ${friendlySyncError(a)}. Check the connection in Jira Accounts.`);
+      } else if (failed.length > 0) {
+        // Mixed: some good, some bad.
+        const okStr = result.new_projects.length
+          ? `Added ${result.new_projects.join(", ")} from ${succeeded.length} workspace(s)`
+          : `${succeeded.length} workspace(s) up to date`;
+        const failedNames = failed.map((a) => `“${a.account_label}”`).join(", ");
+        setSyncMessage(`${okStr}. Failed: ${failedNames} — check Jira Accounts.`);
       } else {
+        // All succeeded. Be honest whether anything changed.
         const parts: string[] = [];
-        if (result.new_projects.length) {
-          parts.push(`Added ${result.new_projects.join(", ")}`);
-        }
-        if (result.deleted_projects.length) {
-          parts.push(`Removed ${result.deleted_projects.join(", ")} (no longer in Jira)`);
-        }
-        setSyncMessage(parts.length ? parts.join(" · ") : "Already up to date.");
+        if (result.new_projects.length) parts.push(`Added ${result.new_projects.join(", ")}`);
+        if (result.deleted_projects.length) parts.push(`Removed ${result.deleted_projects.join(", ")} (no longer in Jira)`);
+        setSyncMessage(parts.length ? parts.join(" · ") : "Up to date — nothing new in Jira since the last check.");
       }
       load();
     } catch (err) {
-      setSyncMessage(err instanceof Error ? `Sync failed: ${err.message}` : "Sync failed");
+      const m = err instanceof Error ? err.message : String(err);
+      setSyncMessage(`Sync didn't complete: ${m}`);
     } finally {
       setSyncing(false);
     }
@@ -64,14 +80,15 @@ export default function JiraStatus() {
     <>
       <h2>Jira & Agents</h2>
       <p className="page-sub">
-        Real-time view of agent runs triggered by Jira webhooks. Polls every 4 seconds.
+        Live view of what Pulse is doing as your Jira tickets move through the workflow.
       </p>
 
       <div className="banner">
-        <strong>Webhook endpoint:</strong> <code>POST /jira/webhook?token=&lt;JIRA_WEBHOOK_SECRET&gt;</code>
+        <strong>How this works:</strong> Pulse listens for ticket events from your connected Jira
+        workspaces and runs AI agents to spot duplicates, deprecations, and cross-team overlap.
         <div className="muted" style={{ marginTop: 6 }}>
-          Configure this URL in Atlassian → Jira settings → System → Webhooks. Point it at your
-          ngrok HTTPS tunnel. Projects are auto-discovered — no allowlist.
+          New projects are discovered automatically the first time a ticket is created in them.
+          You can manually trigger a project refresh with the button below.
         </div>
       </div>
 
@@ -201,4 +218,14 @@ export default function JiraStatus() {
       ))}
     </>
   );
+}
+
+/** Convert a per-account sync failure into something a customer can act on. */
+function friendlySyncError(a: { status?: string; error?: string }): string {
+  switch (a.status) {
+    case "auth_failed": return "the API token isn't accepted anymore (it may have expired)";
+    case "not_found":   return "the Base URL doesn't point to a Jira workspace";
+    case "unreachable": return "Atlassian is unreachable right now";
+    default:            return a.error || "the connection check failed";
+  }
 }

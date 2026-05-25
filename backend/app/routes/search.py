@@ -5,7 +5,10 @@ prose response. /api/search is kept for backward compatibility / programmatic
 use and returns raw vector matches.
 """
 
+import json
+
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,8 +37,58 @@ async def ask(
     body: AskRequest,
     current_user: User = Depends(get_current_user),
 ):
-    result = await query_agent.run(body.message, organization_id=current_user.organization_id)
-    return AskResponse(response=result.text or "(no response)", tool_calls=result.tool_calls)
+    try:
+        result = await query_agent.run(body.message, organization_id=current_user.organization_id)
+        return AskResponse(response=result.text or "(no response)", tool_calls=result.tool_calls)
+    except Exception as e:
+        # Translate transient Anthropic outages into a friendly user-facing
+        # message rather than a generic 500.
+        from anthropic import InternalServerError, APIStatusError
+        if isinstance(e, InternalServerError) or (
+            isinstance(e, APIStatusError) and getattr(e, "status_code", 0) in (529, 503)
+        ):
+            return AskResponse(
+                response="Claude is temporarily overloaded — try again in a minute.",
+                tool_calls=[],
+            )
+        raise
+
+
+@router.post("/ask/stream")
+async def ask_stream(
+    body: AskRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Server-Sent Events variant of /api/ask. The frontend can read tokens as
+    they're generated, so the answer appears word-by-word instead of all-at-once
+    after the full agent loop finishes. Same data, much better perceived speed."""
+
+    async def event_source():
+        try:
+            async for event in query_agent.run_stream(
+                body.message, organization_id=current_user.organization_id
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            from anthropic import InternalServerError, APIStatusError
+            if isinstance(e, InternalServerError) or (
+                isinstance(e, APIStatusError) and getattr(e, "status_code", 0) in (529, 503)
+            ):
+                msg = "Claude is temporarily overloaded — try again in a minute."
+            else:
+                msg = f"Sorry — something went wrong: {e}"
+            yield f"data: {json.dumps({'type': 'text', 'delta': msg})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'tool_calls': []})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx-style buffering on edge proxies
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/search", response_model=list[FeatureSearchHit])

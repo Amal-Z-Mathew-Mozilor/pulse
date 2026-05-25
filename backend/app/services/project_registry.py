@@ -91,18 +91,27 @@ async def list_projects(organization_id: int | None = None) -> list[Project]:
         return list(rows)
 
 
-async def set_product_group(project_key: str, product_group: str) -> Project | None:
+async def set_product_group(
+    project_key: str,
+    product_group: str,
+    organization_id: int | None = None,
+) -> Project | None:
     """Manual override — flips `is_inferred` to False and cascades the change
     to every Ticket and Feature row under this project so the dashboard,
-    semantic search, and downstream agents all see the corrected label."""
+    semantic search, and downstream agents all see the corrected label.
+
+    When `organization_id` is provided, the lookup is scoped to that org so an
+    admin in Acme can't accidentally rename a project label that belongs to Beta.
+    """
     project_key = project_key.upper()
     new_pg = (product_group or "").strip()
     if not new_pg:
         return None
     async with session_scope() as db:
-        row = (
-            await db.execute(select(Project).where(Project.key == project_key))
-        ).scalar_one_or_none()
+        stmt = select(Project).where(Project.key == project_key)
+        if organization_id is not None:
+            stmt = stmt.where(Project.organization_id == organization_id)
+        row = (await db.execute(stmt)).scalar_one_or_none()
         if row is None:
             return None
         old_pg = row.product_group
@@ -117,6 +126,38 @@ async def set_product_group(project_key: str, product_group: str) -> Project | N
             )
         await db.refresh(row)
         return row
+
+
+async def _record_sync_status(
+    account_id: int,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Persist the most-recent sync outcome on the JiraAccount row so the UI
+    can show a 'Connected' / 'Token expired' / 'Cannot reach Jira' pill without
+    having to call /test on every page load."""
+    from datetime import datetime, timezone
+    from sqlalchemy import update as _sqla_update
+    async with session_scope() as db:
+        await db.execute(
+            _sqla_update(JiraAccount)
+            .where(JiraAccount.id == account_id)
+            .values(
+                last_sync_status=status,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_error=error,
+            )
+        )
+
+
+def _classify_http_error(status_code: int) -> str:
+    if status_code in (401, 403):
+        return "auth_failed"
+    if status_code == 404:
+        return "not_found"
+    if 500 <= status_code < 600:
+        return "unreachable"
+    return "error"
 
 
 async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]:
@@ -161,6 +202,33 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
             timeout=20.0,
             headers={"Accept": "application/json"},
         ) as h:
+            # AUTH PROBE: /project/search returns 200-with-empty-list when the
+            # token is invalid — Atlassian treats unauth'd callers as "users
+            # who can see no projects." Without an explicit auth check, we'd
+            # see 200, delete every project we have, and report "Up to date."
+            #
+            # /rest/api/3/myself correctly returns 401 on invalid credentials,
+            # so use it as the gate.
+            me = await h.get(f"{account.base_url.rstrip('/')}/rest/api/3/myself")
+            if me.status_code != 200:
+                log.warning(
+                    "project sync [%s]: auth probe failed — Jira /myself returned %d",
+                    account.label, me.status_code,
+                )
+                status = _classify_http_error(me.status_code)
+                await _record_sync_status(
+                    account.id, status, error=f"Jira /myself returned HTTP {me.status_code}"
+                )
+                return {
+                    "account_id": account.id,
+                    "account_label": account.label,
+                    "synced": 0,
+                    "new_projects": [],
+                    "deleted_projects": [],
+                    "error": f"jira_auth_{me.status_code}",
+                    "status": status,
+                }
+
             start_at = 0
             page_size = 50
             while True:
@@ -177,6 +245,10 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
                         "project sync [%s]: Jira returned %d for /project/search",
                         account.label, r.status_code,
                     )
+                    status = _classify_http_error(r.status_code)
+                    await _record_sync_status(
+                        account.id, status, error=f"Jira returned HTTP {r.status_code}"
+                    )
                     return {
                         "account_id": account.id,
                         "account_label": account.label,
@@ -184,6 +256,7 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
                         "new_projects": new_projects,
                         "deleted_projects": [],
                         "error": f"jira_http_{r.status_code}",
+                        "status": status,
                     }
                 payload = r.json()
                 values = payload.get("values", []) or []
@@ -209,6 +282,7 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
                 start_at += len(values)
     except Exception as exc:
         log.warning("project sync [%s] failed: %s", account.label, exc)
+        await _record_sync_status(account.id, "unreachable", error=str(exc)[:300])
         return {
             "account_id": account.id,
             "account_label": account.label,
@@ -216,6 +290,7 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
             "new_projects": new_projects,
             "deleted_projects": [],
             "error": str(exc)[:200],
+            "status": "unreachable",
         }
 
     # Full Jira traversal succeeded for this account — anything in Pulse but
@@ -232,22 +307,30 @@ async def sync_from_jira(account: "JiraAccount | None" = None) -> dict[str, Any]
             "project sync [%s]: %d new, %d deleted (new=%s, deleted=%s)",
             account.label, len(new_projects), len(deleted_projects), new_projects, deleted_projects,
         )
+    # Success path — record 'ok' so the UI's per-account health pill flips green.
+    await _record_sync_status(account.id, "ok", error=None)
     return {
         "account_id": account.id,
         "account_label": account.label,
         "synced": len(new_projects),
         "new_projects": new_projects,
         "deleted_projects": deleted_projects,
+        "status": "ok",
     }
 
 
-async def sync_all_accounts() -> list[dict[str, Any]]:
+async def sync_all_accounts(organization_id: int | None = None) -> list[dict[str, Any]]:
     """Run `sync_from_jira` for every active account. Each account is synced
     sequentially — projects are isolated per account, so a failure in one
-    doesn't poison the others."""
+    doesn't poison the others.
+
+    When `organization_id` is provided, only that org's Jira accounts are
+    synced — critical for user-triggered sync (admin click) so Acme's button
+    doesn't trigger work on Beta's behalf. The background boot/poll loop
+    passes None to sync every org's accounts."""
     from .jira_accounts import list_accounts
 
-    accounts = await list_accounts(active_only=True)
+    accounts = await list_accounts(active_only=True, organization_id=organization_id)
     results: list[dict[str, Any]] = []
     for acc in accounts:
         try:
@@ -343,7 +426,9 @@ async def _register_with_metadata(
     classifier as `get_or_register`. Returns the new row, or None if a
     concurrent insert beat us to it. Idempotent."""
     project_key = project_key.upper()
-    existing_groups = await _existing_product_groups()
+    # Scope classifier lookups to the caller's org so a project in Beta
+    # doesn't get auto-labeled with a group name that originated in Acme.
+    existing_groups = await _existing_product_groups(organization_id=organization_id)
     product_group = _infer_product_group(project_key, name, existing_groups)
 
     async with session_scope() as db:
@@ -412,43 +497,45 @@ async def _fetch_jira_project_meta(
         return None
 
 
-async def _active_product_groups() -> list[str]:
+async def _active_product_groups(organization_id: int | None = None) -> list[str]:
     """Groups backed by a live Project row — i.e., the originating Jira
-    project still exists. Used to distinguish active vs historical groups."""
+    project still exists. Used to distinguish active vs historical groups.
+
+    When `organization_id` is provided, the result is scoped to that org so
+    we don't leak group names across tenants (e.g. the query agent's prompt
+    should only contain the caller's own groups). When None, returns groups
+    across the whole system — intended ONLY for the classifier's
+    duplicate-label avoidance, never for user-visible output.
+    """
     async with session_scope() as db:
-        rows = (
-            await db.execute(
-                select(Project.product_group).where(Project.product_group != "")
-            )
-        ).all()
+        stmt = select(Project.product_group).where(Project.product_group != "")
+        if organization_id is not None:
+            stmt = stmt.where(Project.organization_id == organization_id)
+        rows = (await db.execute(stmt)).all()
         return sorted({r[0] for r in rows if r[0]})
 
 
-async def _existing_product_groups() -> list[str]:
+async def _existing_product_groups(organization_id: int | None = None) -> list[str]:
     """All product-group labels known to the system — union of the `projects`
     and `features` tables.
 
     Including labels from features (not just live projects) means a group
     whose project was deleted from Jira but whose features were preserved
-    (organizational memory) stays in the known set. Two downstream wins:
+    (organizational memory) stays in the known set.
 
-      - The conversational query agent can still list features for that
-        historical group instead of telling the user it doesn't exist.
-      - The classifier's deterministic match can re-attach a re-created
-        project to its historical label, automatically reconnecting the
-        preserved features.
+    When `organization_id` is provided, results are scoped to that org —
+    critical for the conversational query agent's prompt so we don't reveal
+    other tenants' group names. When None, this returns the global set, used
+    only by the classifier where seeing all labels avoids accidental duplicates.
     """
     async with session_scope() as db:
-        from_projects = (
-            await db.execute(
-                select(Project.product_group).where(Project.product_group != "")
-            )
-        ).all()
-        from_features = (
-            await db.execute(
-                select(Feature.product_group).where(Feature.product_group != "")
-            )
-        ).all()
+        proj_stmt = select(Project.product_group).where(Project.product_group != "")
+        feat_stmt = select(Feature.product_group).where(Feature.product_group != "")
+        if organization_id is not None:
+            proj_stmt = proj_stmt.where(Project.organization_id == organization_id)
+            feat_stmt = feat_stmt.where(Feature.organization_id == organization_id)
+        from_projects = (await db.execute(proj_stmt)).all()
+        from_features = (await db.execute(feat_stmt)).all()
         groups = {r[0] for r in [*from_projects, *from_features] if r[0]}
         return sorted(groups)
 

@@ -28,6 +28,15 @@ export default function DeprecationList() {
             <span className="badge deprecated">deprecated</span>
             <span className="badge">{f.product_group}</span>
             {f.team && f.team !== "Unknown" && <span className="badge">{f.team}</span>}
+            {f.jira_account_label && (
+              <span
+                className="badge"
+                title={f.jira_base_url || undefined}
+                style={{ background: "rgba(91,140,255,0.12)", borderColor: "rgba(91,140,255,0.35)" }}
+              >
+                @ {f.jira_account_label}
+              </span>
+            )}
           </div>
           <p style={{ marginTop: 10, marginBottom: 6 }}>{f.summary}</p>
           {f.deprecation_reason && (
@@ -35,9 +44,7 @@ export default function DeprecationList() {
               <strong>Reason:</strong> {f.deprecation_reason}
             </div>
           )}
-          {f.ticket_key && (
-            <div className="muted" style={{ marginTop: 8 }}>From: {f.ticket_key}</div>
-          )}
+          {f.ticket_key && <div className="muted" style={{ marginTop: 8 }}>From: {f.ticket_key}</div>}
         </div>
       ))}
     </>

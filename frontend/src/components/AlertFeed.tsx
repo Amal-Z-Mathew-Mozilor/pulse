@@ -3,6 +3,8 @@ import { Alert, api } from "../api";
 import { formatISTDateTime } from "../utils/datetime";
 import AlertDetailsPanel from "./AlertDetailsPanel";
 
+type FilterMode = "all" | "unread" | "read";
+
 export default function AlertFeed() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
@@ -12,6 +14,7 @@ export default function AlertFeed() {
   const [busy, setBusy] = useState<Set<number>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<FilterMode>("unread");
 
   // For pending_deprecation alerts: which candidate ticket keys are selected per alert.
   // null means "not yet initialized"; once initialized, we default-select every candidate.
@@ -25,7 +28,7 @@ export default function AlertFeed() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 5000);
+    const t = setInterval(load, 30_000);
     return () => clearInterval(t);
   }, []);
 
@@ -49,8 +52,15 @@ export default function AlertFeed() {
   }, [alerts]);
 
   async function markRead(id: number) {
-    await api.markAlertRead(id);
-    load();
+    // Optimistic update so the read-state flip is instant, like Gmail.
+    setAlerts((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, read_at: a.read_at || new Date().toISOString() } : a)),
+    );
+    try {
+      await api.markAlertRead(id);
+    } catch {
+      load(); // re-sync on failure
+    }
   }
 
   async function deleteAlert(id: number) {
@@ -73,8 +83,8 @@ export default function AlertFeed() {
       const msg = e instanceof Error ? e.message : String(e);
       setError(
         msg.includes("405") || msg.includes("404")
-          ? "Delete failed — the backend doesn't have this route. Restart uvicorn to load the new code."
-          : `Delete failed: ${msg}`,
+          ? "Couldn't delete that alert — Pulse is updating. Please refresh in a moment."
+          : "Couldn't delete that alert. Please try again.",
       );
     } finally {
       setBusy((s) => {
@@ -96,8 +106,8 @@ export default function AlertFeed() {
       const msg = e instanceof Error ? e.message : String(e);
       setError(
         msg.includes("405") || msg.includes("404")
-          ? "Bulk delete failed — the backend doesn't have this route. Restart uvicorn to load the new code."
-          : `Bulk delete failed: ${msg}`,
+          ? "Couldn't clear those alerts — Pulse is updating. Please refresh in a moment."
+          : "Couldn't clear those alerts. Please try again.",
       );
     } finally {
       setBulkBusy(false);
@@ -160,6 +170,11 @@ export default function AlertFeed() {
       else next.add(id);
       return next;
     });
+    // Gmail/Slack pattern: opening an alert marks it as read automatically.
+    const alert = alerts.find((a) => a.id === id);
+    if (alert && !alert.read_at) {
+      void markRead(id);
+    }
   }
 
   function startConfirmDelete(id: number) {
@@ -174,13 +189,38 @@ export default function AlertFeed() {
   }
 
   const readCount = useMemo(() => alerts.filter((a) => a.read_at).length, [alerts]);
+  const unreadCount = useMemo(() => alerts.filter((a) => !a.read_at).length, [alerts]);
+
+  // Apply the read/unread filter.
+  const filtered = useMemo(() => {
+    if (filter === "unread") return alerts.filter((a) => !a.read_at);
+    if (filter === "read") return alerts.filter((a) => !!a.read_at);
+    return alerts;
+  }, [alerts, filter]);
+
+  async function markAllRead() {
+    const unread = alerts.filter((a) => !a.read_at);
+    if (unread.length === 0) return;
+    // Optimistic update first, then fire requests in parallel.
+    const now = new Date().toISOString();
+    setAlerts((prev) =>
+      prev.map((a) => (a.read_at ? a : { ...a, read_at: now })),
+    );
+    await Promise.allSettled(unread.map((a) => api.markAlertRead(a.id)));
+  }
 
   if (loading) return <div className="empty">Loading...</div>;
 
   return (
     <>
       <h2>Alert Feed</h2>
-      <p className="page-sub">Smart alerts emitted by agents. Polls every 5 seconds.</p>
+      <p className="page-sub">
+        Smart alerts emitted by agents. {unreadCount > 0 && (
+          <strong style={{ color: "var(--accent)" }}>
+            {unreadCount} unread
+          </strong>
+        )}
+      </p>
 
       {error && (
         <div className="banner warn" style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -189,47 +229,90 @@ export default function AlertFeed() {
         </div>
       )}
 
-      {readCount > 0 && (
-        <div
-          className="row"
-          style={{ marginBottom: 12, fontSize: 12, color: "var(--muted)" }}
-        >
-          <div className="spacer" />
-          {!bulkConfirming ? (
+      <div className="row" style={{ marginBottom: 16, alignItems: "center" }}>
+        <div className="alert-filter" role="tablist" aria-label="Filter alerts">
+          <button
+            className={filter === "unread" ? "active" : ""}
+            onClick={() => setFilter("unread")}
+            role="tab"
+          >
+            Unread <span className="count">{unreadCount}</span>
+          </button>
+          <button
+            className={filter === "all" ? "active" : ""}
+            onClick={() => setFilter("all")}
+            role="tab"
+          >
+            All <span className="count">{alerts.length}</span>
+          </button>
+          <button
+            className={filter === "read" ? "active" : ""}
+            onClick={() => setFilter("read")}
+            role="tab"
+          >
+            Read <span className="count">{readCount}</span>
+          </button>
+        </div>
+
+        <div className="spacer" />
+
+        {unreadCount > 0 && (
+          <button
+            className="link-button"
+            onClick={markAllRead}
+            style={{ fontSize: 12 }}
+          >
+            Mark all as read
+          </button>
+        )}
+
+        {readCount > 0 && (
+          !bulkConfirming ? (
             <button
-              className="link-button"
+              className="link-button danger"
               onClick={() => setBulkConfirming(true)}
               disabled={bulkBusy}
+              style={{ fontSize: 12 }}
             >
-              Clear all read ({readCount})
+              Clear read ({readCount})
             </button>
           ) : (
             <>
-              <span>Delete {readCount} read alert{readCount === 1 ? "" : "s"}?</span>
+              <span className="muted" style={{ fontSize: 12 }}>
+                Delete {readCount}?
+              </span>
               <button
                 className="link-button danger"
                 onClick={clearAllRead}
                 disabled={bulkBusy}
+                style={{ fontSize: 12 }}
               >
-                {bulkBusy ? "Deleting…" : "Delete all"}
+                {bulkBusy ? "…" : "Confirm"}
               </button>
               <button
                 className="link-button"
                 onClick={() => setBulkConfirming(false)}
                 disabled={bulkBusy}
+                style={{ fontSize: 12 }}
               >
                 Cancel
               </button>
             </>
-          )}
+          )
+        )}
+      </div>
+
+      {filtered.length === 0 && (
+        <div className="empty">
+          {filter === "unread"
+            ? "✨ You're all caught up — no unread alerts."
+            : filter === "read"
+            ? "No alerts have been read yet."
+            : "No alerts. Pulse will create them when the agents find duplicates, deprecations, or cross-product overlap."}
         </div>
       )}
 
-      {alerts.length === 0 && (
-        <div className="empty">No alerts. Trigger an event in the Simulator to generate one.</div>
-      )}
-
-      {alerts.map((a) => {
+      {filtered.map((a) => {
         if (a.type === "pending_deprecation") {
           return (
             <PendingDeprecationCard
@@ -293,12 +376,17 @@ function StandardAlertCard(props: {
   onDelete: () => void;
 }) {
   const { alert: a, isOpen, isConfirming, isBusy } = props;
+  const isUnread = !a.read_at;
   return (
-    <div className="card" style={{ opacity: a.read_at ? 0.55 : 1 }}>
+    <div className={`card ${isUnread ? "alert-unread" : "alert-read"}`}>
       <div className="row">
+        {isUnread && <span className="unread-dot" aria-label="unread" />}
         <strong>{a.title}</strong>
         <span className={`badge ${a.type}`}>{a.type.replaceAll("_", " ")}</span>
         <span className={`badge ${a.severity}`}>{a.severity}</span>
+        <span className={`alert-state-tag ${isUnread ? "unread" : "read"}`}>
+          {isUnread ? "NEW" : "READ"}
+        </span>
         <div className="spacer" />
         <span className="muted">{formatISTDateTime(a.created_at)}</span>
       </div>
@@ -312,7 +400,7 @@ function StandardAlertCard(props: {
               {isOpen ? "Hide Details" : "View Details"}
             </button>
             {!a.read_at && (
-              <button className="secondary" onClick={props.onMarkRead}>
+              <button className="secondary" onClick={props.onMarkRead} title="Mark this alert as read">
                 Mark read
               </button>
             )}
@@ -457,13 +545,18 @@ function CrossProductCard(props: {
   onDelete: () => void;
 }) {
   const { alert: a, isOpen, isConfirming, isBusy } = props;
+  const isUnread = !a.read_at;
   return (
-    <div className="card cross-product-card" style={{ opacity: a.read_at ? 0.7 : 1 }}>
+    <div className={`card cross-product-card ${isUnread ? "alert-unread" : "alert-read"}`}>
       <div className="row">
+        {isUnread && <span className="unread-dot" aria-label="unread" />}
         <span className="cross-product-card__fyi-pill">FYI</span>
         <strong>{a.title}</strong>
         <span className="badge cross_product_consideration">cross product</span>
         <span className="badge info-soft">info</span>
+        <span className={`alert-state-tag ${isUnread ? "unread" : "read"}`}>
+          {isUnread ? "NEW" : "READ"}
+        </span>
         <div className="spacer" />
         <span className="muted">{formatISTDateTime(a.created_at)}</span>
       </div>

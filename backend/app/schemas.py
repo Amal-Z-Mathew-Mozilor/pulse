@@ -34,6 +34,12 @@ class FeatureOut(BaseModel):
     restored_reason: str | None = None
     created_at: datetime
     updated_at: datetime
+    # Workspace context — which connected Jira account this feature belongs to.
+    # NULL only when the parent JiraAccount was deleted (the Feature itself
+    # survives as historical organizational memory).
+    jira_account_id: int | None = None
+    jira_account_label: str | None = None
+    jira_base_url: str | None = None
 
 
 class FeatureSearchHit(BaseModel):
@@ -148,6 +154,12 @@ class JiraAccountOut(BaseModel):
     is_default: bool
     has_token: bool
     has_webhook_secret: bool
+    # Persistent health snapshot — populated by sync_from_jira on every run.
+    # Frontend uses last_sync_status to show a 'Connected' / 'Token expired'
+    # / 'Cannot reach Jira' pill on each row.
+    last_sync_status: str = "never"
+    last_sync_at: datetime | None = None
+    last_sync_error: str | None = None
     created_at: datetime
     updated_at: datetime
 
