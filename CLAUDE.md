@@ -8,19 +8,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See `README.md` for the user-facing setup walkthrough, including Atlassian token + ngrok configuration.
 
+## Repo layout — three independent git repos (read this first)
+
+This working directory looks like a monorepo but isn't. There are **three separate git repositories**, each with its own GitHub remote, and committing to one does not move the others:
+
+| Path | Remote | Deploys to |
+|---|---|---|
+| `Pulse/` (outer) | (snapshot tracker; not auto-deployed) | nothing |
+| `Pulse/backend/` | `github.com/Amal-Z-Mathew-Mozilor/pulse-backend.git` | **Railway** (web + worker services) |
+| `Pulse/frontend/` | `github.com/Amal-Z-Mathew-Mozilor/pulse-frontend.git` | **Vercel** |
+
+The outer monorepo's `git status` will look clean even when `backend/` has uncommitted changes — the nested `.git` directories hide each other. **Before believing a fix is deployed, `cd backend && git status && git log --oneline -1` (and same in `frontend/`).** A backend-only change must be committed and pushed from inside `backend/`; same for frontend.
+
+Railway has two services from the backend repo's `Procfile`: `web` (uvicorn) and `worker` (procrastinate). A push triggers both, but they redeploy independently — expect ~2-3 minutes for `web` and another 3-5 min for `worker`. While the worker is on the old code, freshly-dispatched jobs run with stale agent/tool code even though the API serves the new code.
+
 ## Commands
 
 ```bash
 # Backend (in backend/)
 source .venv/bin/activate
-pip install -r requirements.txt              # picks up asyncpg + cryptography + arq + redis
+pip install -r requirements.txt              # picks up asyncpg + cryptography + procrastinate
 python -m seed                                # load example features
 uvicorn app.main:app --reload --port 8000
 
-# Arq worker (in a second terminal, also from backend/ with the venv active)
-# Required for the production dispatch path. If REDIS_URL is unset, the API
-# silently falls back to BackgroundTasks and you don't need this.
-arq app.worker.WorkerSettings
+# Procrastinate worker (second terminal, also from backend/ with the venv active).
+# Required for the production dispatch path. If procrastinate can't connect
+# (DB unreachable, missing schema), the API silently falls back to FastAPI
+# BackgroundTasks and you don't need this.
+PYTHONPATH=. procrastinate --app=app.worker.app worker
 
 # Frontend (in frontend/)
 npm install
@@ -95,32 +110,36 @@ POST /jira-webhook/{account_id}    (FastAPI, returns 200 immediately)
        │
        │  services/dispatcher.dispatch_event(event, request, background_tasks)
        ▼
-   ┌── Arq pool (Redis) ──► Worker process (arq app.worker.WorkerSettings)
-   │                            │
-   │                            ▼
-   │                       orchestrator.handle_event(event)
-   │                            │
-   │                            ▼
-   │                       agents + tools
+   ┌── Procrastinate (Postgres LISTEN/NOTIFY) ──► Worker process
+   │                                                  │  procrastinate --app=app.worker.app worker
+   │                                                  ▼
+   │                                              orchestrator.handle_event(event)
+   │                                                  │
+   │                                                  ▼
+   │                                              agents + tools
    │
-   └── (fallback) FastAPI BackgroundTasks if REDIS_URL unset or pool init failed
+   └── (fallback) FastAPI BackgroundTasks if procrastinate init failed
 ```
 
 `app/services/dispatcher.py` is the single decision point — webhook handlers
-call `dispatch_event()` and don't care which backend is wired up. The Arq pool
-is created in `main.lifespan` and attached to `app.state.arq`.
+call `dispatch_event()` and don't care which backend is wired up. The procrastinate
+`App` is opened in `main.lifespan` and attached to `app.state.queue`. Procrastinate
+uses Postgres (`procrastinate_jobs` table + LISTEN/NOTIFY) — no Redis. The session
+pooler is required for LISTEN/NOTIFY (set `PROCRASTINATE_DATABASE_URL` to the
+port-5432 URL; the main app can stay on the transaction pooler at 6543).
 
 The worker is a long-running process that imports the same modules as the API
-(`app/worker.py`). Run it with `arq app.worker.WorkerSettings`. Arq picks up
-job timeouts, retry count, and `redis_settings` from that class.
+(`app/worker.py`). On Railway it's a **separate service** from the API — both
+deploy from the same git push but redeploy independently, so a fresh push may
+have new API code running against old worker code for a few minutes.
 
 When debugging a stuck event, check three things in order:
-1. The webhook handler's response had `"dispatch": {"mode": "arq", "job_id": ...}`.
-2. The Arq worker terminal shows `worker: handling event job_id=...`.
+1. The webhook handler's response had `"dispatch": {"mode": "procrastinate", "job_id": ...}`.
+2. The worker terminal shows the job being picked up.
 3. The `agent_runs` table shows the agent execution.
 
-If `mode` is `background_task` instead of `arq`, either `REDIS_URL` isn't set
-or the pool init failed — check the API process boot log for the Arq message.
+If `mode` is `background_tasks` instead of `procrastinate`, the queue pool failed
+to open — check the API process boot log for the procrastinate init warning.
 
 ## Critical conventions
 
@@ -142,6 +161,10 @@ or the pool init failed — check the API process boot log for the Arq message.
 
 **Optimistic concurrency on state changes.** Functions that flip a feature's lifecycle (`_mark_feature_deprecated`, `restore_feature`) use conditional `UPDATE ... WHERE status = :original_status` rather than ORM attribute mutation. If the row was modified by a concurrent writer between read and write, the UPDATE matches zero rows and the function returns `concurrent_modification` (tool) or 409 (HTTP) instead of silently clobbering. Don't downgrade these to plain ORM mutation — the race was real, not theoretical.
 
+**Request-scoped state lives in context vars.** `org_id_var` and `jira_account_id_var` in `app/context.py` are set by `agents/base.run_and_log()` so tool handlers can stamp the right tenant + Jira account on writes without threading the IDs through every call site. When adding a tool that creates a row owned by an org/account (e.g. `_store_feature`), read both vars and write them to the row's foreign keys; otherwise the row ends up orphaned and the "features survive account deletion" semantics break in reverse (features are born orphaned).
+
+**Additive migrations are a hand-curated list, not Alembic.** `_ADDITIVE_MIGRATIONS` in `app/db.py` only ALTERs the columns explicitly listed. `Base.metadata.create_all` builds new tables but won't add a new column to an existing one. When adding a column to an existing model, **also add the (table, column, sql_type) tuple to that list**, or fresh Postgres deployments will boot with the column missing and the relevant UPDATE will throw at runtime. (Today the `jira_accounts.last_sync_*` columns happen to exist in deployed Supabase from a clean `create_all`, but they aren't in the migration list — latent risk.)
+
 ## Adding new endpoints
 
 - Public (no auth): mount under `/auth/*` or `/jira-webhook/*`.
@@ -154,6 +177,8 @@ or the pool init failed — check the API process boot log for the Arq message.
 2. Wrap it in a `ToolSpec(name, description, input_schema, handler)`.
 3. Add the spec to the relevant agent's `TOOLS` list (e.g. `app/agents/duplicate.py`).
 4. The agent's system prompt should reference the tool by name — write the prompt assuming the exact tool name is stable.
+5. If the tool **persists a row scoped to an org or Jira account**, read `org_id_var` and `jira_account_id_var` from `app/context.py` and stamp the values on the row (and on vector store metadata). Use `_store_feature` as the reference implementation. Forgetting either leaves the row orphaned and cross-tenant queries miss it.
+6. If you add an agent that should propagate the Jira account context (because its tools eventually call account-scoped writes), update the agent's `run(...)` signature to accept `jira_account_id` and forward it to `run_and_log(...)`. Same pattern as `organization_id`. The orchestrator already has the value on `event["jira_account_id"]`.
 
 ## Frontend conventions
 
